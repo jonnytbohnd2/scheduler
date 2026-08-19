@@ -249,7 +249,16 @@ _FILLER = (
 
 #: Removed only when something else survives. "오전 3시 알람" has to keep
 #: "알람" as its title, but "내일 3시 회의 알람 등록" should not.
-_FILLER_SOFT = ("리마인드", "리마인더", "알람", "알림", "reminder", "alarm")
+#:
+#: The container words come from real usage: "매월 12일에 [할일에] 특약OS이월
+#: 넣어줘" and "…8월18일 [할일로] 등록해줘" were filing tasks named
+#: "할일에 특약OS이월" and "…bdx 할일". The user is naming the list to put the
+#: item in, not the item.
+_FILLER_SOFT = (
+    "리마인드", "리마인더", "알람", "알림", "reminder", "alarm",
+    "할일에", "할 일에", "할일로", "할 일로", "할일", "할 일",
+    "일정에", "일정으로", "스케줄에", "투두", "todo",
+)
 
 # --------------------------------------------------------------------------- #
 # Weekday tokens
@@ -1954,6 +1963,13 @@ def _selftest() -> None:  # pragma: no cover
         ("수요일 10시 회의", TOOL_ADD, "회의"),
         ("매주 수 10시 스터디", TOOL_ADD, "스터디"),
         ("다음주 수 3시 외근", TOOL_ADD, "외근"),
+        # --- from the production log: the to-do list is the container, not
+        #     part of the task name ---
+        ("매월 12일에 할일에 특약OS이월 넣어줘", TOOL_ADD, "특약OS이월"),
+        ("2026.7월 프론팅계약 bdx 8월18일 할일로 등록해줘", TOOL_ADD, "2026.7월 프론팅계약 bdx"),
+        ("9월 9일까지 TCPL KYC 서류 확보", TOOL_ADD, "TCPL KYC 서류 확보"),
+        ("김보성 db 카피 요청 3시간 후 알림 설정해줘", TOOL_ADD, "김보성 db 카피 요청"),
+        ("내일 아레나 계산서 처리 마무리하기 오전 11시", TOOL_ADD, "아레나 계산서 처리 마무리하기"),
     ]
     for text, expect, extra in tool_cases:
         intent = detect_tool_intent(text, parser, now)
@@ -1968,9 +1984,10 @@ def _selftest() -> None:  # pragma: no cover
         detail = (intent.schedule.title if intent.schedule else
                   intent.scope if expect == TOOL_LIST else intent.query)
         if ok and expect == TOOL_ADD and intent.schedule:
-            # A bare phrase must still land on the right moment, not just the
-            # right tool.
-            ok = intent.schedule.target_time is not None
+            # A bare phrase must still land on the right moment, and the title
+            # must be exactly the task -- no container words leaking in.
+            ok = (intent.schedule.target_time is not None
+                  and intent.schedule.title == extra)
             detail = f"{intent.schedule.title!r} @ {intent.schedule.target_time}"
         print(f"{'OK  ' if ok else 'FAIL'} {text!r:34} -> {intent.tool:6} {detail!r}")
 

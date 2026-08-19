@@ -1886,20 +1886,32 @@ class NotificationSound:
     100 % offline. Falls back to the platform beep if QtMultimedia is missing.
     """
 
+    #: Cap on rebuild attempts, so a permanently broken audio stack does not
+    #: retry on every single alarm.
+    MAX_REBUILDS = 5
+
     def __init__(self, path: Optional[str] = None, volume: float = 0.45) -> None:
         base = os.path.dirname(os.path.abspath(__file__))
         self.path = path or os.path.join(base, "assets", "notify.wav")
         self._effect = None
         self._volume = volume
+        self._rebuilds = 0
+        self._build_effect()
+
+    def _build_effect(self) -> bool:
+        """(Re)create the QSoundEffect. Returns True on success."""
         try:
             self._ensure_file()
             from PySide6.QtMultimedia import QSoundEffect
 
-            self._effect = QSoundEffect()
-            self._effect.setSource(QUrl.fromLocalFile(self.path))
-            self._effect.setVolume(max(0.0, min(1.0, volume)))
+            effect = QSoundEffect()
+            effect.setSource(QUrl.fromLocalFile(self.path))
+            effect.setVolume(max(0.0, min(1.0, self._volume)))
+            self._effect = effect
+            return True
         except Exception:                                # noqa: BLE001
             self._effect = None
+            return False
 
     def set_volume(self, volume: float) -> None:
         self._volume = max(0.0, min(1.0, float(volume)))
@@ -1940,14 +1952,33 @@ class NotificationSound:
             handle.writeframes(bytes(frames))
 
     def play(self) -> None:
+        """Play the chime, recovering from a lost audio device.
+
+        This app stays open for days. Sleep/undock/headphone changes invalidate
+        the WASAPI client (``AUDCLNT_E_DEVICE_INVALIDATED`` in the wild), and
+        the QSoundEffect never recovers on its own -- every later alarm would be
+        silent with no visible sign. So a dead effect is rebuilt once per
+        failure before falling back to the system beep.
+        """
         try:
             if self._effect is not None and self._effect.status() != self._effect.Status.Error:
                 self._effect.play()
                 return
         except Exception:                                # noqa: BLE001
             pass
+
+        # Effect is dead (or was never built): try once to rebuild it.
+        if self._rebuilds < self.MAX_REBUILDS:
+            self._rebuilds += 1
+            if self._build_effect():
+                try:
+                    self._effect.play()
+                    return
+                except Exception:                        # noqa: BLE001
+                    pass
+
         try:
-            QApplication.beep()
+            QApplication.beep()                          # always audible fallback
         except Exception:                                # noqa: BLE001
             pass
 
