@@ -1660,7 +1660,10 @@ class ChatInput(QWidget):
 class NotificationCard(SoftCard):
     """In-window alarm popup with snooze / done."""
 
+    #: The user actively closed the card -- they saw it.
     dismissed = Signal()
+    #: The card auto-hid with no interaction -- they probably did not.
+    timed_out = Signal()
     snoozed = Signal(int)
     completed = Signal()
 
@@ -1712,7 +1715,7 @@ class NotificationCard(SoftCard):
 
         self._auto_hide = QTimer(self)
         self._auto_hide.setSingleShot(True)
-        self._auto_hide.timeout.connect(self.hide_card)
+        self._auto_hide.timeout.connect(self._on_timeout)
         self.apply_style()
 
     def apply_style(self) -> None:
@@ -1737,21 +1740,33 @@ class NotificationCard(SoftCard):
     # -- api ------------------------------------------------------------------ #
 
     def show_alarm(self, schedule: Schedule, auto_hide_ms: int = 25000,
-                   snooze_minutes: int = 5) -> None:
+                   snooze_minutes: int = 5, missed_count: int = 0) -> None:
+        """``missed_count`` > 0 marks this as a nudge for an ignored alarm."""
         s = style()
         self._schedule_id = schedule.id
         self._snooze_minutes = max(1, snooze_minutes)
-        self.kicker.setText("★ 일정 알림")
+        accent = s.warn if missed_count else s.accent
+        self.kicker.setText(
+            f"★ 놓친 알림 · {missed_count}번째" if missed_count else "★ 일정 알림")
         self.kicker.setStyleSheet(
-            f"color: {s.css(s.accent)}; font-size: {s.f_xs}px; font-weight: 700;")
+            f"color: {s.css(accent)}; font-size: {s.f_xs}px; font-weight: 700;")
         self.title.setText(schedule.title)
         repeat = f" · {schedule.repeat_label}" if schedule.is_recurring else ""
-        self.subtitle.setText(f"{schedule.target_time.strftime('%H:%M')} 예정{repeat}")
+        if missed_count:
+            # Report the occurrence that was missed, not the next one: a
+            # recurring row has already moved on by the time we nudge.
+            missed_at = schedule.missed_time
+            late = humanize_countdown((missed_at - datetime.now()).total_seconds())
+            self.subtitle.setText(
+                f"{missed_at.strftime('%m/%d %H:%M')} 예정 · {late}{repeat}")
+        else:
+            self.subtitle.setText(
+                f"{schedule.target_time.strftime('%H:%M')} 예정{repeat}")
         self.subtitle.setVisible(True)
         for btn in self.snooze_buttons:
             btn.setVisible(True)
         self.done_btn.setVisible(True)
-        self.set_colors(s.alpha(s.bg, 250), s.alpha(s.accent, 180))
+        self.set_colors(s.alpha(s.bg, 250), s.alpha(accent, 190))
         self._reveal(auto_hide_ms)
 
     def show_message(self, kicker: str, title: str, body: str = "",
@@ -1783,9 +1798,15 @@ class NotificationCard(SoftCard):
             self._auto_hide.start(auto_hide_ms)
 
     def hide_card(self) -> None:
+        """Explicit close (✕). Counts as "I saw this"."""
         self._auto_hide.stop()
         self.hide()
         self.dismissed.emit()
+
+    def _on_timeout(self) -> None:
+        """Auto-hide. Deliberately does NOT count as acknowledgement."""
+        self.hide()
+        self.timed_out.emit()
 
     def _on_done(self) -> None:
         self.completed.emit()
@@ -2659,6 +2680,18 @@ class SettingsDialog(GlassDialog):
         layout.addWidget(self._row("미루기", self._spin(
             1, 240, b["snooze_minutes"], "분",
             lambda v: self._apply("behavior", "snooze_minutes", v))))
+        layout.addWidget(self._check("놓친 알림 다시 알리기", b["nag_enabled"],
+                                     lambda v: self._apply("behavior", "nag_enabled", v)))
+        layout.addWidget(self._row("다시 알림", self._spin(
+            1, 180, b["nag_minutes"], "분 뒤",
+            lambda v: self._apply("behavior", "nag_minutes", v))))
+        layout.addWidget(self._row("최대 횟수", self._spin(
+            1, 20, b["nag_max_count"], "회",
+            lambda v: self._apply("behavior", "nag_max_count", v))))
+        nag_hint = QLabel("완료·미루기·닫기 중 아무것도 안 하면 다시 알립니다.")
+        nag_hint.setObjectName("muted")
+        nag_hint.setWordWrap(True)
+        layout.addWidget(nag_hint)
 
         layout.addWidget(self._section("일정"))
         layout.addWidget(self._row("확인 주기", self._spin(

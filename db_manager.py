@@ -104,6 +104,15 @@ class Schedule:
     notified: int = 0
     is_done: int = 0
     created_at: str = ""
+    nag_at: Optional[datetime] = None
+    nag_count: int = 0
+    #: The occurrence that was missed (recurring rows have moved on since).
+    nag_origin: Optional[datetime] = None
+
+    @property
+    def missed_time(self) -> datetime:
+        """When the ignored alarm was actually due."""
+        return self.nag_origin or self.target_time
 
     # -- convenience ------------------------------------------------------- #
     @property
@@ -137,6 +146,10 @@ class Schedule:
             notified=int(row["notified"] or 0),
             is_done=int(row["is_done"] or 0),
             created_at=(row["created_at"] or ""),
+            nag_at=parse_time(row["nag_at"]) if "nag_at" in row.keys() else None,
+            nag_count=int((row["nag_count"] if "nag_count" in row.keys() else 0) or 0),
+            nag_origin=(parse_time(row["nag_origin"])
+                        if "nag_origin" in row.keys() else None),
         )
 
 
@@ -392,7 +405,15 @@ CREATE TABLE IF NOT EXISTS schedules (
     repeat_detail TEXT    DEFAULT '',
     notified      INTEGER NOT NULL DEFAULT 0,     -- 0 = pending, 1 = fired
     is_done       INTEGER NOT NULL DEFAULT 0,     -- 0 = open,    1 = completed
-    created_at    TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
+    -- Re-reminder for an alarm the user never reacted to. nag_at is when to
+    -- nudge again; NULL means nothing pending (acknowledged, or nagged out).
+    nag_at        TEXT,
+    nag_count     INTEGER NOT NULL DEFAULT 0,
+    -- The occurrence that was actually missed. A recurring row has already
+    -- rolled forward by nag time, so without this the nudge would show the
+    -- *next* due date instead of the one the user walked past.
+    nag_origin    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_schedules_due
     ON schedules (notified, is_done, target_time);
@@ -472,15 +493,21 @@ class DatabaseManager:
     def _migrate(self) -> None:
         """Add columns that older installs may be missing (idempotent)."""
         cols = {r["name"] for r in self._sched().execute("PRAGMA table_info(schedules)")}
-        if "created_at" not in cols:
+        for name, ddl in (
+            ("created_at", "ALTER TABLE schedules ADD COLUMN created_at TEXT "
+                           "NOT NULL DEFAULT ''"),
+            ("nag_at", "ALTER TABLE schedules ADD COLUMN nag_at TEXT"),
+            ("nag_count", "ALTER TABLE schedules ADD COLUMN nag_count INTEGER "
+                          "NOT NULL DEFAULT 0"),
+            ("nag_origin", "ALTER TABLE schedules ADD COLUMN nag_origin TEXT"),
+        ):
+            if name in cols:
+                continue
             try:
-                self._sched().execute(
-                    "ALTER TABLE schedules ADD COLUMN created_at TEXT "
-                    "NOT NULL DEFAULT ''"
-                )
-                log.info("Migrated schedules: added created_at")
+                self._sched().execute(ddl)
+                log.info("Migrated schedules: added %s", name)
             except sqlite3.Error as exc:
-                log.warning("Migration failed: %s", exc)
+                log.warning("Migration failed for %s: %s", name, exc)
 
     def close(self) -> None:
         """Close this thread's connections (call from each worker on shutdown)."""
@@ -605,6 +632,49 @@ class DatabaseManager:
 
     def mark_notified(self, schedule_id: int, notified: int = 1) -> None:
         self.update_schedule(schedule_id, notified=int(notified))
+
+    # ---------------- missed-alarm re-reminders ---------------- #
+
+    def arm_nag(self, schedule_id: int, when: datetime, count: int = 0,
+                origin: Optional[datetime] = None) -> None:
+        """Schedule a nudge for an alarm the user has not reacted to yet.
+
+        ``origin`` is the occurrence that was missed; pass it on the first arm
+        so a recurring row (already rolled forward) still reports the right
+        time. Later re-arms keep whatever origin is already stored.
+        """
+        with self._lock:
+            if origin is not None:
+                self._sched().execute(
+                    "UPDATE schedules SET nag_at = ?, nag_count = ?, nag_origin = ? "
+                    "WHERE id = ?",
+                    (fmt_time(when), int(count), fmt_time(origin), int(schedule_id)),
+                )
+            else:
+                self._sched().execute(
+                    "UPDATE schedules SET nag_at = ?, nag_count = ? WHERE id = ?",
+                    (fmt_time(when), int(count), int(schedule_id)),
+                )
+
+    def clear_nag(self, schedule_id: int) -> None:
+        """The user acted (완료 / 미루기 / 카드 닫기) -- stop nudging."""
+        with self._lock:
+            self._sched().execute(
+                "UPDATE schedules SET nag_at = NULL, nag_count = 0, nag_origin = NULL "
+                "WHERE id = ?",
+                (int(schedule_id),),
+            )
+
+    def due_nags(self, now: Optional[datetime] = None) -> list[Schedule]:
+        """Open items whose re-reminder time has arrived."""
+        now = now or datetime.now()
+        rows = self._sched().execute(
+            "SELECT * FROM schedules "
+            "WHERE is_done = 0 AND nag_at IS NOT NULL AND nag_at <= ? "
+            "ORDER BY nag_at ASC",
+            (fmt_time(now),),
+        ).fetchall()
+        return [Schedule.from_row(r) for r in rows]
 
     def set_done(self, schedule_id: int, done: bool | int = True) -> None:
         """Raw completion flag. Completing also silences pending alarms.
@@ -1151,6 +1221,24 @@ def _selftest() -> None:  # pragma: no cover - manual smoke test
     assert db.sanitize_chat() == 0                # idempotent
     assert db.clear_chat() == 3
     assert db.recent_messages() == []
+
+    # --- missed-alarm nagging ----------------------------------------------- #
+    nagged = db.add_schedule("놓칠 일정", datetime(2026, 8, 12, 9, 0))
+    assert db.due_nags(datetime(2026, 8, 12, 9, 5)) == []      # nothing armed yet
+    db.arm_nag(nagged, datetime(2026, 8, 12, 9, 10), 0)
+    assert db.due_nags(datetime(2026, 8, 12, 9, 9)) == []      # not yet
+    pending = db.due_nags(datetime(2026, 8, 12, 9, 11))
+    assert [s.id for s in pending] == [nagged], pending
+    assert pending[0].nag_count == 0 and pending[0].nag_at is not None
+    db.arm_nag(nagged, datetime(2026, 8, 12, 9, 20), 1)
+    assert db.due_nags(datetime(2026, 8, 12, 9, 21))[0].nag_count == 1
+    db.clear_nag(nagged)
+    assert db.due_nags(datetime(2026, 8, 12, 23, 0)) == [], "cleared nag still fires"
+    # a completed item never nags
+    db.arm_nag(nagged, datetime(2026, 8, 12, 9, 10), 0)
+    db.set_done(nagged, True)
+    assert db.due_nags(datetime(2026, 8, 12, 23, 0)) == [], "done item nagged"
+    db.delete_schedule(nagged)
 
     # --- backup ------------------------------------------------------------ #
     db.add_schedule("백업 대상", datetime(2026, 9, 1, 9, 0))

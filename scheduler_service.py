@@ -38,6 +38,8 @@ class SchedulerService(QObject):
     #: A schedule has just come due. Payload: the :class:`Schedule` **as it was
     #: when it fired** (before any recurrence roll-forward).
     schedule_due = Signal(object)
+    #: A previously fired alarm the user never reacted to. (schedule, nth time)
+    schedule_missed = Signal(object, int)
     #: Emitted whenever rows were modified by the service (refresh your views).
     schedules_changed = Signal()
     #: Heartbeat, once per poll -- handy for "next alarm in ..." headers.
@@ -54,10 +56,15 @@ class SchedulerService(QObject):
         db: DatabaseManager,
         interval_seconds: int = 5,
         parent: Optional[QObject] = None,
+        nag_minutes: int = 10,
+        nag_max: int = 3,
     ) -> None:
         super().__init__(parent)
         self.db = db
         self.interval_seconds = max(1, int(interval_seconds))
+        #: Gap between re-reminders, and how many times to try.
+        self.nag_minutes = max(1, int(nag_minutes))
+        self.nag_max = max(1, int(nag_max))
         self._scheduler = None
         self._lock = threading.Lock()
         self._running = False
@@ -152,6 +159,7 @@ class SchedulerService(QObject):
             due = self.db.due_schedules(now)
             if due:
                 self._fire(due, now)
+            self._fire_nags(now)
             self.tick.emit()
         except Exception as exc:                       # noqa: BLE001
             # A crash here would silently kill the job, so swallow + report.
@@ -181,6 +189,40 @@ class SchedulerService(QObject):
             except Exception:                          # noqa: BLE001
                 log.exception("Failed to process schedule #%s", schedule.id)
         self.schedules_changed.emit()
+
+    def _fire_nags(self, now: datetime) -> None:
+        """Nudge again for alarms that were never acknowledged.
+
+        An alarm the user walked past just turns red and sits there, which is
+        exactly when a reminder is most needed. The nag repeats until they
+        complete it, snooze it, or dismiss the card -- capped so a forgotten
+        item cannot pester forever.
+        """
+        try:
+            pending = self.db.due_nags(now)
+        except Exception:                              # noqa: BLE001
+            log.exception("Nag lookup failed")
+            return
+        if not pending:
+            return
+
+        changed = False
+        for schedule in pending[:self.MAX_BURST]:
+            count = int(schedule.nag_count) + 1
+            try:
+                if count >= self.nag_max:
+                    self.db.clear_nag(schedule.id)     # gave it our best shot
+                else:
+                    self.db.arm_nag(
+                        schedule.id, now + timedelta(minutes=self.nag_minutes), count)
+                log.info("Missed-alarm nudge #%d for #%d %r",
+                         count, schedule.id, schedule.title)
+                self.schedule_missed.emit(schedule, count)
+                changed = True
+            except Exception:                          # noqa: BLE001
+                log.exception("Could not nudge schedule #%s", schedule.id)
+        if changed:
+            self.schedules_changed.emit()
 
     # ------------------------------------------------------------------ #
     # helpers used by the UI

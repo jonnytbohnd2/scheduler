@@ -217,6 +217,10 @@ DEFAULTS: dict[str, Any] = {
         # upgrades, since the databases live next to the executable.
         "backup_on_start": True,
         "backup_keep_days": 10,
+        # Re-remind when an alarm is ignored (no 완료/미루기/닫기).
+        "nag_enabled": True,
+        "nag_minutes": 10,
+        "nag_max_count": 3,
     },
     "llm": {
         "model_path": "",           # empty -> auto-discover in models/
@@ -496,6 +500,9 @@ class Config:
         b["outlook_enabled"] = bool(b.get("outlook_enabled", True))
         b["backup_on_start"] = bool(b.get("backup_on_start", True))
         b["backup_keep_days"] = int(_clamp(b.get("backup_keep_days"), 1, 90, 10))
+        b["nag_enabled"] = bool(b.get("nag_enabled", True))
+        b["nag_minutes"] = int(_clamp(b.get("nag_minutes"), 1, 180, 10))
+        b["nag_max_count"] = int(_clamp(b.get("nag_max_count"), 1, 20, 3))
 
         m["n_ctx"] = int(_clamp(m.get("n_ctx"), 512, 32768, 4096))
         m["n_threads"] = int(_clamp(m.get("n_threads"), 0, 128, 0))

@@ -148,7 +148,10 @@ class HudWindow(QWidget):
 
         self.sound = NotificationSound(volume=config.behavior["sound_volume"])
         self.llm = LlmController(dict(config.llm))
-        self.scheduler = SchedulerService(db, interval_seconds=config.behavior["poll_seconds"])
+        self.scheduler = SchedulerService(
+            db, interval_seconds=config.behavior["poll_seconds"],
+            nag_minutes=int(config.behavior.get("nag_minutes", 10)),
+            nag_max=int(config.behavior.get("nag_max_count", 3)))
         self.outlook = OutlookMonitorController(
             db, interval_seconds=int(config.behavior.get("outlook_poll_seconds", 10)))
 
@@ -330,11 +333,15 @@ class HudWindow(QWidget):
         self.llm.chat_error.connect(self.on_chat_error)
 
         self.scheduler.schedule_due.connect(self.on_schedule_due)
+        self.scheduler.schedule_missed.connect(self.on_schedule_missed)
         self.scheduler.schedules_changed.connect(self.refresh_schedules)
         self.scheduler.error.connect(lambda m: self.toast.show_text(m, "error"))
 
         self.notification.completed.connect(self._complete_active_alarm)
         self.notification.snoozed.connect(self._snooze_active_alarm)
+        # Closing the card means "I saw it"; timing out does not, so only the
+        # explicit close stops the re-reminders.
+        self.notification.dismissed.connect(self._acknowledge_active_alarm)
 
         self.outlook.email_matched.connect(self.on_awaited_email_matched)
         self.outlook.service_status.connect(self.on_outlook_status)
@@ -883,11 +890,64 @@ class HudWindow(QWidget):
             auto_hide_ms=int(b["notification_seconds"]) * 1000,
             snooze_minutes=int(b["snooze_minutes"]))
         self.schedule_list.highlight(schedule.id)
+        # `schedule` is the row as it fired, so this is the occurrence the user
+        # will have missed even after a recurring row rolls forward.
+        self._arm_nag(schedule.id, missed=schedule.target_time)
 
         if b["tray_balloon"] and self.tray is not None and self.tray.isVisible():
             self.tray.showMessage(
                 "일정 알림", f"{schedule.title}\n{schedule.target_time.strftime('%H:%M')}",
                 make_app_icon(), 8000)
+
+    @guard("놓친 알람 재알림")
+    def on_schedule_missed(self, schedule: object, count: int) -> None:
+        """Re-reminder for an alarm that was never acknowledged."""
+        if not isinstance(schedule, Schedule):
+            return
+        b = self.config.behavior
+        log.info("Missed-alarm nudge #%d: %s", count, schedule.title)
+        self._active_alarm = schedule
+
+        if b["sound_enabled"]:
+            self.sound.play()
+        self._alert_until = datetime.now() + timedelta(milliseconds=ALERT_HOLD_MS)
+        if not self.isVisible():
+            self.show_hud()
+        if self.config.window["collapsed"]:
+            self.set_collapsed(False)
+        self._apply_opacity(immediate=True)
+        if b["flash_on_alert"]:
+            self.panel.flash_alert(style().warn, pulses=int(b["alert_pulses"]))
+
+        self.tabs.setCurrentIndex(0)
+        self._position_notification()
+        self.notification.show_alarm(
+            schedule,
+            auto_hide_ms=int(b["notification_seconds"]) * 1000,
+            snooze_minutes=int(b["snooze_minutes"]),
+            missed_count=count)
+        self.schedule_list.highlight(schedule.id)
+
+        if b["tray_balloon"] and self.tray is not None and self.tray.isVisible():
+            self.tray.showMessage(
+                f"놓친 알림 · {count}번째",
+                f"{schedule.title}\n{schedule.target_time.strftime('%H:%M')} 예정",
+                make_app_icon(), 8000)
+
+    def _arm_nag(self, schedule_id: int, missed: Optional[datetime] = None) -> None:
+        """Start the re-reminder clock for a freshly fired alarm."""
+        b = self.config.behavior
+        if not b.get("nag_enabled", True):
+            return
+        minutes = int(b.get("nag_minutes", 10))
+        self.db.arm_nag(schedule_id, datetime.now() + timedelta(minutes=minutes),
+                        0, origin=missed)
+
+    @guard("알람 확인 처리", toast=False)
+    def _acknowledge_active_alarm(self) -> None:
+        """Card closed by hand -- the user has seen it, stop nudging."""
+        if self._active_alarm is not None:
+            self.db.clear_nag(self._active_alarm.id)
 
     @guard("알람 완료")
     def _complete_active_alarm(self) -> None:
@@ -895,6 +955,7 @@ class HudWindow(QWidget):
         if self._active_alarm is None:
             return
         title = self._active_alarm.title
+        self.db.clear_nag(self._active_alarm.id)
         action, nxt = self.db.complete_schedule(self._active_alarm.id, True)
         self.refresh_schedules()
         if action == "rolled" and nxt is not None:
@@ -911,6 +972,7 @@ class HudWindow(QWidget):
         if schedule is None:
             return
         when = datetime.now().replace(second=0, microsecond=0) + timedelta(minutes=minutes)
+        self.db.clear_nag(schedule.id)      # snoozing IS acknowledging
         if schedule.is_recurring:
             # The series already rolled forward; add a one-off so the
             # recurrence itself stays untouched.
