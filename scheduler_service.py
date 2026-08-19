@@ -51,6 +51,11 @@ class SchedulerService(QObject):
     #: from a week of sleep should not machine-gun the user with popups.
     MAX_BURST = 5
 
+    #: A nudge replaces whatever card is on screen, so firing several at once
+    #: would burn their retry budget on cards nobody ever saw. One per minute;
+    #: the rest stay due and come round on a later poll.
+    NAG_SPACING_SECONDS = 60
+
     def __init__(
         self,
         db: DatabaseManager,
@@ -68,6 +73,7 @@ class SchedulerService(QObject):
         self._scheduler = None
         self._lock = threading.Lock()
         self._running = False
+        self._last_nag: Optional[datetime] = None
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -205,24 +211,27 @@ class SchedulerService(QObject):
             return
         if not pending:
             return
+        if (self._last_nag is not None
+                and (now - self._last_nag).total_seconds() < self.NAG_SPACING_SECONDS):
+            return
 
-        changed = False
-        for schedule in pending[:self.MAX_BURST]:
-            count = int(schedule.nag_count) + 1
-            try:
-                if count >= self.nag_max:
-                    self.db.clear_nag(schedule.id)     # gave it our best shot
-                else:
-                    self.db.arm_nag(
-                        schedule.id, now + timedelta(minutes=self.nag_minutes), count)
-                log.info("Missed-alarm nudge #%d for #%d %r",
-                         count, schedule.id, schedule.title)
-                self.schedule_missed.emit(schedule, count)
-                changed = True
-            except Exception:                          # noqa: BLE001
-                log.exception("Could not nudge schedule #%s", schedule.id)
-        if changed:
-            self.schedules_changed.emit()
+        # Oldest miss first, one per pass -- see NAG_SPACING_SECONDS.
+        schedule = min(pending, key=lambda s: s.nag_at or now)
+        count = int(schedule.nag_count) + 1
+        try:
+            if count >= self.nag_max:
+                self.db.clear_nag(schedule.id)         # gave it our best shot
+            else:
+                self.db.arm_nag(
+                    schedule.id, now + timedelta(minutes=self.nag_minutes), count)
+        except Exception:                              # noqa: BLE001
+            log.exception("Could not nudge schedule #%s", schedule.id)
+            return
+        self._last_nag = now
+        log.info("Missed-alarm nudge #%d for #%d %r (%d pending)",
+                 count, schedule.id, schedule.title, len(pending))
+        self.schedule_missed.emit(schedule, count)
+        self.schedules_changed.emit()
 
     # ------------------------------------------------------------------ #
     # helpers used by the UI

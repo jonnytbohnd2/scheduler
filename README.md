@@ -35,6 +35,16 @@ air-gapped PC.
 - On an alarm: the border pulses with an accent glow, the panel jumps to full
   opacity, a chime plays and a notification card slides in
 
+**Missed-alarm nudges**
+- An alarm you never acted on comes back 10 minutes later, up to 3 times
+- Completing, snoozing or closing the card by hand counts as acknowledgement;
+  letting the card auto-hide does not — that is exactly the missed case
+- The nudge is amber and reports **the occurrence you walked past**
+  (`08/19 14:00 예정 · 1시간 10분 지남`), even for a recurring row that has
+  already rolled forward — hence the separate `nag_origin` column
+- Survives a restart, and a backlog is paced one per minute, oldest first,
+  so no item burns its retry budget on a card that was never on screen
+
 **Recurring to-dos**
 - Ticking off a recurring item advances it to the next cycle instead of
   finishing it forever — `08/12 → 09/12`, with a toast saying so

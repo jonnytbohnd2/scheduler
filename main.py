@@ -931,7 +931,7 @@ class HudWindow(QWidget):
         if b["tray_balloon"] and self.tray is not None and self.tray.isVisible():
             self.tray.showMessage(
                 f"놓친 알림 · {count}번째",
-                f"{schedule.title}\n{schedule.target_time.strftime('%H:%M')} 예정",
+                f"{schedule.title}\n{schedule.missed_time.strftime('%H:%M')} 예정",
                 make_app_icon(), 8000)
 
     def _arm_nag(self, schedule_id: int, missed: Optional[datetime] = None) -> None:
