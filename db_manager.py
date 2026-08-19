@@ -432,6 +432,40 @@ CREATE INDEX IF NOT EXISTS idx_awaited_active
     ON awaited_emails (is_active, is_triggered);
 """
 
+def _columns_of(schema: str, table: str) -> list[tuple[str, str]]:
+    """(name, declaration) for every column of `table` that ALTER can add.
+
+    Feeds `_migrate`, so the declarations are normalised to what SQLite will
+    accept in `ADD COLUMN`: no PRIMARY KEY, and no computed DEFAULT -- for an
+    existing row "when it was created" is unknowable anyway, so those become a
+    constant and the row reads as empty rather than as today.
+    """
+    body = re.search(
+        rf"CREATE TABLE (?:IF NOT EXISTS )?{table}\s*\((.*?)\n\);",
+        schema, re.S)
+    if not body:
+        return []
+    out: list[tuple[str, str]] = []
+    for line in body.group(1).splitlines():
+        line = re.sub(r"--.*$", "", line).strip().rstrip(",").strip()
+        if not line or line.upper().startswith(("PRIMARY KEY", "UNIQUE",
+                                                "FOREIGN KEY", "CHECK")):
+            continue
+        name, _, decl = line.partition(" ")
+        decl = decl.strip()
+        if not decl or "PRIMARY KEY" in decl.upper():
+            continue                                   # id column
+        # Greedy to the last ")": the default may itself contain parentheses,
+        # e.g. DEFAULT (datetime('now','localtime')).
+        decl = re.sub(r"DEFAULT\s*\(.*\)\s*$",
+                      "DEFAULT 0" if "INTEGER" in decl.upper() else "DEFAULT ''",
+                      decl, flags=re.I)
+        if "NOT NULL" in decl.upper() and "DEFAULT" not in decl.upper():
+            decl += " DEFAULT 0" if "INTEGER" in decl.upper() else " DEFAULT ''"
+        out.append((name, decl))
+    return out
+
+
 _CHAT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_messages (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -491,23 +525,29 @@ class DatabaseManager:
             self._migrate()
 
     def _migrate(self) -> None:
-        """Add columns that older installs may be missing (idempotent)."""
-        cols = {r["name"] for r in self._sched().execute("PRAGMA table_info(schedules)")}
-        for name, ddl in (
-            ("created_at", "ALTER TABLE schedules ADD COLUMN created_at TEXT "
-                           "NOT NULL DEFAULT ''"),
-            ("nag_at", "ALTER TABLE schedules ADD COLUMN nag_at TEXT"),
-            ("nag_count", "ALTER TABLE schedules ADD COLUMN nag_count INTEGER "
-                          "NOT NULL DEFAULT 0"),
-            ("nag_origin", "ALTER TABLE schedules ADD COLUMN nag_origin TEXT"),
-        ):
-            if name in cols:
+        """Add columns that older installs are missing (idempotent).
+
+        `CREATE TABLE IF NOT EXISTS` leaves an existing table exactly as it is,
+        so a DB from an older build keeps its old column set while the code
+        reads the new one -- and a missing column is a hard crash on open, i.e.
+        the user's data looks lost. The wanted list is derived from the schema
+        above rather than hand-maintained, so adding a column there is enough.
+        """
+        for table, ddl in (("schedules", _SCHEDULE_SCHEMA),
+                           ("awaited_emails", _SCHEDULE_SCHEMA)):
+            have = {r["name"] for r in
+                    self._sched().execute(f"PRAGMA table_info({table})")}
+            if not have:                               # brand-new DB, nothing to do
                 continue
-            try:
-                self._sched().execute(ddl)
-                log.info("Migrated schedules: added %s", name)
-            except sqlite3.Error as exc:
-                log.warning("Migration failed for %s: %s", name, exc)
+            for name, decl in _columns_of(ddl, table):
+                if name in have:
+                    continue
+                try:
+                    self._sched().execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                    log.info("Migrated %s: added %s", table, name)
+                except sqlite3.Error as exc:
+                    log.warning("Migration failed for %s.%s: %s", table, name, exc)
 
     def close(self) -> None:
         """Close this thread's connections (call from each worker on shutdown)."""
@@ -1259,6 +1299,33 @@ def _selftest() -> None:  # pragma: no cover - manual smoke test
     assert len(remaining) == 3, remaining
     # a bad path is reported, not raised
     assert db.backup_to("\0invalid") is None
+
+    # --- opening a database from an older build ----------------------------- #
+    # A missing column is a crash on open, which to the user looks like their
+    # data is gone. Simulate the oldest schema we ever shipped.
+    legacy_dir = os.path.join(tmp, "legacy")
+    os.makedirs(legacy_dir, exist_ok=True)
+    legacy = sqlite3.connect(os.path.join(legacy_dir, "schedules.db"))
+    legacy.executescript(
+        "CREATE TABLE schedules ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  title TEXT NOT NULL,"
+        "  target_time TEXT NOT NULL,"
+        "  repeat_type TEXT NOT NULL DEFAULT 'none',"
+        "  notified INTEGER NOT NULL DEFAULT 0,"
+        "  is_done INTEGER NOT NULL DEFAULT 0);"
+        "INSERT INTO schedules (title, target_time, repeat_type)"
+        "  VALUES ('묵은 일정', '2026-08-12 09:00:00', 'monthly');")
+    legacy.commit()
+    legacy.close()
+    old_db = DatabaseManager(legacy_dir)
+    kept = old_db.list_schedules(include_done=True)
+    assert len(kept) == 1 and kept[0].title == "묵은 일정", kept
+    assert kept[0].repeat_type == "monthly", "repeat lost in migration"
+    assert kept[0].nag_at is None and kept[0].nag_count == 0, kept[0]
+    old_db.arm_nag(kept[0].id, kept[0].target_time, 0, origin=kept[0].target_time)
+    assert old_db.due_nags(kept[0].target_time), "nag broken on a migrated row"
+    old_db.close()
 
     db.close()
     print(f"db_manager self-test OK  ({tmp})")
