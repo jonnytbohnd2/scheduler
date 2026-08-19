@@ -1,0 +1,37 @@
+# Offline Smart HUD - runtime dependencies
+# ----------------------------------------
+# Install on an INTERNET-CONNECTED machine, then move the built folder (or a
+# wheel cache) to the air-gapped target. Nothing here phones home at runtime.
+
+PySide6>=6.6,<7            # GUI, animations, tray, QSoundEffect (QtMultimedia)
+APScheduler>=3.10,<4       # background alarm polling
+pywin32>=306               # Outlook COM (awaited-email reminders); Windows only
+#   Optional: without it the app runs normally and only the awaited-email
+#   watcher stays disabled, reporting "pywin32 미설치".
+
+# ---------------------------------------------------------------------------
+# Local LLM runtime (OPTIONAL but required for the 🤖 AI Assistant tab)
+# ---------------------------------------------------------------------------
+# llama-cpp-python publishes NO prebuilt Windows wheel on PyPI - a plain
+# `pip install llama-cpp-python` tries to compile from source and needs MSVC.
+# Use the maintainer's wheel index instead:
+#
+#   CPU:
+#     pip install llama-cpp-python \
+#         --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+#
+#   NVIDIA CUDA 12.4 (much faster if you have a GPU):
+#     pip install llama-cpp-python \
+#         --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+#
+# It is intentionally left un-pinned here so `pip install -r requirements.txt`
+# never fails on a machine without a compiler. The app degrades gracefully:
+# without it, schedule entry still works via the built-in offline parser and
+# only the chat tab is disabled.
+#
+# llama-cpp-python>=0.3.0
+
+# ---------------------------------------------------------------------------
+# Build-time only
+# ---------------------------------------------------------------------------
+# pyinstaller>=6.0

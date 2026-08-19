@@ -1,0 +1,39 @@
+# --- models -------------------------------------------------------------
+# GGUF weights are 1-3 GB each; GitHub hard-rejects blobs over 100 MB.
+# The app loads them from ./models at runtime -- see models/README.md.
+models/*.gguf
+models/*.bin
+models/*.safetensors
+
+# --- generated at runtime ------------------------------------------------
+schedules.db
+chat_history.db
+*.db-wal
+*.db-shm
+config.json
+config.json.broken
+*.lock
+logs/
+
+# assets/ is regenerated from code (build.py draws the icon, the app writes
+# the chime on first alarm), so it is a build artefact rather than a source.
+assets/
+
+# --- build output --------------------------------------------------------
+build/
+dist/
+*.spec
+*.manifest
+
+# --- python --------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- editor / OS ---------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
