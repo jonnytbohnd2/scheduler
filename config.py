@@ -93,6 +93,10 @@ DEFAULTS: dict[str, Any] = {
         # Awaited-email monitoring (Outlook COM)
         "outlook_enabled": True,
         "outlook_poll_seconds": 10,
+        # Daily DB snapshot into ./backups -- the safety net for folder-replace
+        # upgrades, since the databases live next to the executable.
+        "backup_on_start": True,
+        "backup_keep_days": 10,
     },
     "llm": {
         "model_path": "",           # empty -> auto-discover in models/
@@ -370,6 +374,8 @@ class Config:
                      "confirm_delete", "hide_completed", "autostart_hint_shown"):
             b[flag] = bool(b.get(flag, False))
         b["outlook_enabled"] = bool(b.get("outlook_enabled", True))
+        b["backup_on_start"] = bool(b.get("backup_on_start", True))
+        b["backup_keep_days"] = int(_clamp(b.get("backup_keep_days"), 1, 90, 10))
 
         m["n_ctx"] = int(_clamp(m.get("n_ctx"), 512, 32768, 4096))
         m["n_threads"] = int(_clamp(m.get("n_threads"), 0, 128, 0))

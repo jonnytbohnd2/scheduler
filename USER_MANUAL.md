@@ -355,12 +355,50 @@ logs\faulthandler.log     프로그램이 강제 종료된 경우의 흔적
 
 ---
 
-## 10. 저장되는 파일
+## 10. 새 버전으로 업그레이드 (데이터 보존)
+
+**중요:** 일정·메일 규칙·설정은 `OfflineSmartHUD.exe` **바로 옆**에 저장됩니다.
+새 빌드 폴더로 **통째로 덮어쓰면 전부 사라집니다.**
+
+### 안전한 방법 — 동봉된 스크립트
+새 빌드 폴더에서 PowerShell을 열고:
+
+```powershell
+.\upgrade.ps1 -Target "C:\FTC_downloads\OfflineSmartHUD"
+```
+
+스크립트가 하는 일:
+1. 실행 중인 앱을 종료
+2. 기존 DB·설정을 `backups\pre-upgrade-<시각>\` 에 복사
+3. `OfflineSmartHUD.exe` 와 `_internal` 만 교체 (`_internal`은 통째로 갈아끼워
+   이전 버전 잔여 파일을 남기지 않습니다)
+4. **일정 DB · 메일 감지 규칙 · 대화 기록 · 설정 · 로그 · 모델은 그대로 유지**
+
+대상 폴더가 설치 폴더가 아니거나, 원본과 대상이 같으면 아무것도 하지 않고 멈춥니다.
+
+### 수동으로 한다면
+새 폴더에서 이 둘만 복사하세요. 나머지는 건드리지 마세요.
+
+| 교체할 것 | 절대 덮어쓰면 안 되는 것 |
+|---|---|
+| `OfflineSmartHUD.exe` | `schedules.db` (일정 + 메일 규칙) |
+| `_internal\` (기존 것 삭제 후 복사) | `chat_history.db`, `config.json` |
+| | `models\`, `logs\`, `backups\` |
+
+### 자동 백업
+앱은 시작할 때마다 두 DB의 스냅샷을 `backups\<날짜>\` 에 남깁니다(최근 10일 보관).
+실수로 덮어썼더라도 여기서 `schedules.db` 를 되돌리면 복구됩니다.
+`설정 → config.json` 의 `backup_on_start`, `backup_keep_days` 로 조절합니다.
+
+---
+
+## 11. 저장되는 파일
 
 ```
-schedules.db      일정 + 기다리는 메일 규칙
-chat_history.db   대화 기록
-config.json       설정
+schedules.db      일정 + 기다리는 메일 규칙   ← 업그레이드 시 보존 필수
+chat_history.db   대화 기록                  ← 보존
+config.json       설정                       ← 보존
+backups\<날짜>\   DB 자동 스냅샷 (최근 10일)  ← 보존
 logs\             기록
 models\           AI 모델 (.gguf)
 assets\notify.wav 알림음 (자동 생성)

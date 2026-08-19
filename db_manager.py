@@ -905,6 +905,61 @@ class DatabaseManager:
         return len(doomed)
 
     # ------------------------------------------------------------------ #
+    # backup
+    # ------------------------------------------------------------------ #
+
+    def backup_to(self, directory: str, keep: int = 10) -> Optional[str]:
+        """Snapshot both databases into ``directory/<date>/``.
+
+        Uses SQLite's online backup API rather than copying the file: in WAL
+        mode the ``.db`` on disk can lag behind the ``-wal`` sidecar, so a
+        plain copy is not guaranteed to be consistent.
+
+        One snapshot per calendar day (re-running the same day overwrites it),
+        pruned to the newest ``keep`` days. Returns the folder written, or
+        ``None`` if it could not be written -- a failed backup must never stop
+        the app from starting.
+        """
+        try:
+            stamp = datetime.now().strftime("%Y%m%d")
+            target = os.path.join(directory, stamp)
+            os.makedirs(target, exist_ok=True)
+
+            for name, conn in (("schedules.db", self._sched()),
+                               ("chat_history.db", self._chat())):
+                path = os.path.join(target, name)
+                with self._lock:
+                    dest = sqlite3.connect(path)
+                    try:
+                        conn.backup(dest)
+                    finally:
+                        dest.close()
+
+            self._prune_backups(directory, keep)
+            log.info("Database backup written to %s", target)
+            return target
+        except Exception as exc:                       # noqa: BLE001
+            log.warning("Database backup failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _prune_backups(directory: str, keep: int) -> None:
+        try:
+            days = sorted(
+                name for name in os.listdir(directory)
+                if len(name) == 8 and name.isdigit()
+                and os.path.isdir(os.path.join(directory, name))
+            )
+            for stale in days[:-max(1, keep)]:
+                for root, _dirs, files in os.walk(os.path.join(directory, stale),
+                                                  topdown=False):
+                    for file in files:
+                        os.remove(os.path.join(root, file))
+                    os.rmdir(root)
+        except OSError as exc:
+            log.debug("Backup prune skipped: %s", exc)
+
+    # ------------------------------------------------------------------ #
     # misc
     # ------------------------------------------------------------------ #
 
@@ -1096,6 +1151,26 @@ def _selftest() -> None:  # pragma: no cover - manual smoke test
     assert db.sanitize_chat() == 0                # idempotent
     assert db.clear_chat() == 3
     assert db.recent_messages() == []
+
+    # --- backup ------------------------------------------------------------ #
+    db.add_schedule("백업 대상", datetime(2026, 9, 1, 9, 0))
+    backup_root = os.path.join(tmp, "backups")
+    written = db.backup_to(backup_root, keep=3)
+    assert written and os.path.isdir(written), written
+    for name in ("schedules.db", "chat_history.db"):
+        assert os.path.isfile(os.path.join(written, name)), name
+    # the snapshot must be a real, readable database with our row in it
+    snap = DatabaseManager(written)
+    assert any(s.title == "백업 대상" for s in snap.list_schedules()), "backup empty"
+    snap.close()
+    # pruning keeps the newest N day-folders
+    for day in ("20250101", "20250102", "20250103", "20250104"):
+        os.makedirs(os.path.join(backup_root, day), exist_ok=True)
+    db._prune_backups(backup_root, keep=3)
+    remaining = sorted(d for d in os.listdir(backup_root) if d.isdigit())
+    assert len(remaining) == 3, remaining
+    # a bad path is reported, not raised
+    assert db.backup_to("\0invalid") is None
 
     db.close()
     print(f"db_manager self-test OK  ({tmp})")

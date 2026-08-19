@@ -243,6 +243,25 @@ Deploying to the air-gapped machine:
 2. Drop the `.gguf` file into `OfflineSmartHUD/models/`
 3. Run `OfflineSmartHUD.exe`
 
+### Upgrading an existing install
+
+The databases live **next to the executable**, so replacing the folder wholesale
+destroys the user's schedules and mail rules. Every build ships an
+`upgrade.ps1` that does it safely — run it from the *new* folder:
+
+```powershell
+.\upgrade.ps1 -Target "C:\path\to\installed\OfflineSmartHUD"
+```
+
+It stops the app, snapshots the data to `backups/pre-upgrade-<ts>/`, replaces
+`OfflineSmartHUD.exe` and `_internal/` (deleting the old `_internal` first so
+stale files from the previous version cannot linger), and leaves
+`schedules.db`, `chat_history.db`, `config.json`, `logs/` and `models/` alone.
+
+As a second line of defence the app snapshots both databases into
+`backups/<date>/` on every start (10 days retained, `backup_on_start` in
+config.json).
+
 The build generates its own icon and notification chime from code, so there
 are no binary art assets to ship.
 

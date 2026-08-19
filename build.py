@@ -300,6 +300,87 @@ def build(console: bool = False, with_model: bool = False,
     return out_dir
 
 
+#: Shipped inside every build. The app keeps its databases next to the
+#: executable (deliberately -- portable, air-gap friendly, one folder to copy),
+#: which makes "replace the folder" the obvious upgrade and also the one that
+#: destroys the user's schedules. This script makes the safe path the easy one.
+UPGRADE_PS1 = r"""# OfflineSmartHUD 업그레이드 (데이터 보존)
+#
+#   .\upgrade.ps1 -Target "C:\FTC_downloads\OfflineSmartHUD"
+#
+# 새 빌드 폴더에서 실행하세요. 프로그램 파일만 교체하고
+# 일정/메일규칙/설정/로그는 그대로 둡니다.
+param(
+    [Parameter(Mandatory = $true)][string]$Target
+)
+$ErrorActionPreference = "Stop"
+$Source = $PSScriptRoot
+
+# 사용자 데이터 - 절대 덮어쓰지 않는다
+$Keep = @("schedules.db", "chat_history.db", "config.json",
+          "schedules.db-wal", "schedules.db-shm",
+          "chat_history.db-wal", "chat_history.db-shm")
+
+if (-not (Test-Path "$Target\OfflineSmartHUD.exe")) {
+    Write-Host "[!] 대상 폴더에 OfflineSmartHUD.exe 가 없습니다: $Target" -ForegroundColor Red
+    Write-Host "    설치 폴더 경로를 -Target 으로 지정하세요." -ForegroundColor Red
+    exit 1
+}
+if ((Resolve-Path $Source).Path -eq (Resolve-Path $Target).Path) {
+    Write-Host "[!] 원본과 대상이 같은 폴더입니다." -ForegroundColor Red
+    exit 1
+}
+
+$running = Get-Process OfflineSmartHUD -ErrorAction SilentlyContinue
+if ($running) {
+    Write-Host "[*] 실행 중인 앱을 종료합니다..."
+    $running | Stop-Process -Force
+    Start-Sleep -Seconds 2
+}
+
+$stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
+$backup = Join-Path $Target "backups\pre-upgrade-$stamp"
+New-Item -ItemType Directory -Force -Path $backup | Out-Null
+foreach ($f in $Keep) {
+    if (Test-Path "$Target\$f") { Copy-Item "$Target\$f" $backup -Force }
+}
+Write-Host "[*] 기존 데이터 백업: $backup"
+
+# _internal 은 통째로 교체한다(이전 버전 잔여 파일 제거).
+if (Test-Path "$Target\_internal") { Remove-Item "$Target\_internal" -Recurse -Force }
+Copy-Item "$Source\_internal" $Target -Recurse -Force
+Copy-Item "$Source\OfflineSmartHUD.exe" $Target -Force
+foreach ($doc in @("README.md", "upgrade.ps1")) {
+    if (Test-Path "$Source\$doc") { Copy-Item "$Source\$doc" $Target -Force }
+}
+
+# models 는 건드리지 않는다. 대상에 GGUF 가 없고 원본에 있으면 그때만 복사.
+$hasModel = Get-ChildItem "$Target\models" -Filter *.gguf -ErrorAction SilentlyContinue
+if (-not $hasModel) {
+    $newModel = Get-ChildItem "$Source\models" -Filter *.gguf -ErrorAction SilentlyContinue
+    if ($newModel) { Copy-Item $newModel.FullName "$Target\models" -Force }
+}
+
+Write-Host ""
+Write-Host "[OK] 업그레이드 완료" -ForegroundColor Green
+Write-Host "     유지됨 : 일정 DB / 메일 감지 규칙 / 대화 기록 / 설정 / 로그 / 모델"
+Write-Host "     교체됨 : OfflineSmartHUD.exe, _internal"
+Write-Host "     백업   : $backup"
+Write-Host ""
+Write-Host "     실행: $Target\OfflineSmartHUD.exe"
+"""
+
+
+def _write_upgrade_script(out_dir: Path) -> None:
+    try:
+        # utf-8-sig, not utf-8: Windows PowerShell 5.1 reads a BOM-less script
+        # as ANSI, which turns every Korean message in it into mojibake.
+        (out_dir / "upgrade.ps1").write_text(UPGRADE_PS1, encoding="utf-8-sig")
+        info("wrote upgrade.ps1 (data-preserving upgrade helper)")
+    except OSError as exc:
+        info(f"could not write upgrade.ps1 ({exc})")
+
+
 def finalise(out_dir: Path, with_model: bool = False,
              model_file: Optional[Path] = None) -> None:
     """Create the runtime layout the app expects next to the executable."""
@@ -319,6 +400,8 @@ def finalise(out_dir: Path, with_model: bool = False,
         "offline parser; only the AI chat tab is disabled.\n",
         encoding="utf-8",
     )
+
+    _write_upgrade_script(out_dir)
 
     source_models = HERE / "models"
     if model_file is not None:

@@ -14,6 +14,7 @@ config.json
 config.json.broken
 *.lock
 logs/
+backups/
 
 # assets/ is regenerated from code (build.py draws the icon, the app writes
 # the chime on first alarm), so it is a build artefact rather than a source.

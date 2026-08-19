@@ -1430,6 +1430,13 @@ def main() -> int:
         return _fatal("데이터베이스를 열 수 없습니다.",
                       f"{exc}\n\n위치: {base}\n폴더 쓰기 권한을 확인해주세요.")
 
+    # Daily snapshot before anything touches the data. Schedules and mail rules
+    # live next to the executable, so a careless folder-replace upgrade would
+    # otherwise take them with it. Cheap (a few hundred KB) and never fatal.
+    if config.behavior.get("backup_on_start", True):
+        db.backup_to(os.path.join(base, "backups"),
+                     keep=int(config.behavior.get("backup_keep_days", 10)))
+
     # ---- window ---- #
     try:
         window = HudWindow(db, config)
