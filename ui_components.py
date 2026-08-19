@@ -94,6 +94,53 @@ from scheduler_service import humanize_countdown
 # Helpers
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Idle ghost fade
+# --------------------------------------------------------------------------- #
+# Lowering only the window opacity was not enough: the inner cards keep their
+# own slate-800 fill, so at rest the HUD read as a column of dark blocks
+# floating over a bright desktop. The fills have to fade *with* the panel.
+#
+# `_IDLE_FADE` runs 0..1 (0 = fully idle/ghost, 1 = engaged) and is driven by
+# the same animation that fades the panel background, so everything moves
+# together. Text is never faded -- only fills and hairlines.
+
+_IDLE_FADE = 1.0
+
+
+def idle_fade() -> float:
+    return _IDLE_FADE
+
+
+def set_idle_fade(value: float) -> bool:
+    """Set the engagement level. Returns True when it actually changed."""
+    global _IDLE_FADE
+    value = max(0.0, min(1.0, float(value)))
+    if abs(value - _IDLE_FADE) < 0.02:
+        return False
+    _IDLE_FADE = value
+    return True
+
+
+def faded(color: QColor, floor: float = 0.0) -> QColor:
+    """Scale a fill/border alpha by the current engagement level.
+
+    ``floor`` keeps a minimum fraction of the alpha so an element never becomes
+    completely invisible (used for borders, which give the cards their shape).
+    """
+    out = QColor(color)
+    scale = floor + (1.0 - floor) * _IDLE_FADE
+    out.setAlpha(max(0, min(255, int(out.alpha() * scale))))
+    return out
+
+
+def repaint_faded(root: QWidget) -> None:
+    """Ask every fade-aware widget under ``root`` to redraw."""
+    for widget in root.findChildren(QWidget):
+        if isinstance(widget, (SoftCard, ChatBubble)):
+            widget.update()
+
+
 def chip_color(repeat_type: str) -> QColor:
     s = style()
     return {
@@ -393,6 +440,11 @@ class GlassPanel(QFrame):
         value = max(0.0, min(1.0, float(value)))
         if abs(value - self._active) > 0.004:
             self._active = value
+            # Inner cards fade on the same curve as the panel fill, so the HUD
+            # dissolves as one object rather than leaving dark blocks behind.
+            floor = style().idle_card_fade
+            if set_idle_fade(floor + (1.0 - floor) * value):
+                repaint_faded(self)
             self.update()
 
     active = Property(float, get_active, set_active_value)
@@ -499,14 +551,19 @@ class SoftCard(QFrame):
     def apply_style(self) -> None:
         self.update()
 
+    #: Cards fade with the panel, but keep a sliver of border so shapes stay
+    #: legible at rest instead of dissolving into a text-only smear.
+    FADE_FILL_FLOOR = 0.12
+    FADE_BORDER_FLOOR = 0.30
+
     def paintEvent(self, event) -> None:  # noqa: N802
         s = style()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         radius = self._radius if self._radius is not None else s.card_radius
-        painter.setPen(QPen(self._border or s.line, 1.0))
-        painter.setBrush(self._fill or s.soft)
+        painter.setPen(QPen(faded(self._border or s.line, self.FADE_BORDER_FLOOR), 1.0))
+        painter.setBrush(faded(self._fill or s.soft, self.FADE_FILL_FLOOR))
         painter.drawRoundedRect(rect, radius, radius)
 
 
@@ -1302,37 +1359,49 @@ class ChatBubble(QFrame):
         self.box.addWidget(self.label)
         self.apply_style()
 
+    FADE_FILL_FLOOR = 0.12
+    FADE_BORDER_FLOOR = 0.30
+
     def apply_style(self) -> None:
         s = style()
         pad_v, pad_h = max(4, s.card_pad), max(6, s.card_pad + 3)
         self.box.setContentsMargins(pad_h, pad_v, pad_h, pad_v)
         self.box.setSpacing(0)
-        # 14 px bubbles with one squared-off corner pointing at the speaker.
-        radius = max(12, s.card_radius + 2)
-        tail = 4
-        if self.sender == "user":
-            self.setStyleSheet(f"""
-                QFrame {{
-                    background: {s.css(s.accent, 70)};
-                    border: 1px solid {s.css(s.accent, 145)};
-                    border-radius: {radius}px;
-                    border-bottom-right-radius: {tail}px;
-                }}
-                QLabel {{ color: {s.css(s.text)}; background: transparent;
-                          border: 0; font-size: {s.f_md}px; }}
-            """)
-        else:
-            self.setStyleSheet(f"""
-                QFrame {{
-                    background: {s.css(s.softer, min(255, s.softer.alpha() + 48))};
-                    border: 1px solid {s.css(s.line, 80)};
-                    border-radius: {radius}px;
-                    border-bottom-left-radius: {tail}px;
-                }}
-                QLabel {{ color: {s.css(s.text)}; background: transparent;
-                          border: 0; font-size: {s.f_md}px; }}
-            """)
+        # Only the text is styled here. The bubble background is painted in
+        # paintEvent so it can fade with the panel -- a QSS background is a
+        # fixed colour and would stay a solid dark block while idle.
+        self.setStyleSheet(
+            f"QLabel {{ color: {s.css(s.text)}; background: transparent;"
+            f" border: 0; font-size: {s.f_md}px; }}")
         self._fit()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        s = style()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = max(12, s.card_radius + 2)
+        tail = 4.0
+
+        if self.sender == "user":
+            fill, border = s.alpha(s.accent, 70), s.alpha(s.accent, 145)
+        else:
+            fill = s.alpha(s.softer, min(255, s.softer.alpha() + 48))
+            border = s.alpha(s.line, 80)
+
+        # Rounded box with one squared-off corner pointing at the speaker.
+        path = QPainterPath()
+        path.setFillRule(Qt.WindingFill)
+        path.addRoundedRect(rect, radius, radius)
+        if self.sender == "user":
+            corner = QRectF(rect.right() - radius, rect.bottom() - radius, radius, radius)
+        else:
+            corner = QRectF(rect.left(), rect.bottom() - radius, radius, radius)
+        path.addRoundedRect(corner, tail, tail)
+
+        painter.setPen(QPen(faded(border, self.FADE_BORDER_FLOOR), 1.0))
+        painter.setBrush(faded(fill, self.FADE_FILL_FLOOR))
+        painter.drawPath(path.simplified())
 
     # -- sizing -------------------------------------------------------------- #
 
@@ -2233,6 +2302,129 @@ class ManualScheduleDialog(GlassDialog):
 # Settings
 # --------------------------------------------------------------------------- #
 
+class AwaitedEmailDialog(GlassDialog):
+    """Add / edit one awaited-email rule."""
+
+    def __init__(self, parent: Optional[QWidget] = None, keywords: str = "",
+                 action: str = "", sender: str = "") -> None:
+        super().__init__(parent, "메일 감지 규칙", width=320)
+        s = style()
+
+        hint = QLabel("받은 메일의 제목·본문에 키워드가 있으면 알리고, 아래 후속 업무를 띄웁니다.")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        self.body.addWidget(hint)
+
+        self.body.addWidget(self._label("키워드  (쉼표로 여러 개)"))
+        self.kw_edit = QLineEdit(keywords)
+        self.kw_edit.setPlaceholderText("특약OS이월, 특약이월")
+        self.kw_edit.setFixedHeight(s.ctl_h)
+        self.body.addWidget(self.kw_edit)
+
+        self.body.addWidget(self._label("후속 업무  (여러 줄 가능)"))
+        self.action_edit = QPlainTextEdit(action)
+        self.action_edit.setPlaceholderText("1. 결재 시스템 승인\n2. 담당자 이메일 공유")
+        self.action_edit.setFixedHeight(s.ctl_h * 3)
+        self.body.addWidget(self.action_edit)
+
+        self.body.addWidget(self._label("발신자 필터  (선택)"))
+        self.sender_edit = QLineEdit(sender)
+        self.sender_edit.setPlaceholderText("팀장  또는  @koreanre.co.kr")
+        self.sender_edit.setFixedHeight(s.ctl_h)
+        self.body.addWidget(self.sender_edit)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("취소")
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(cancel)
+        save = QPushButton("저장")
+        save.setObjectName("primary")
+        save.setDefault(True)
+        save.clicked.connect(self._on_save)
+        buttons.addWidget(save)
+        self.body.addLayout(buttons)
+        self.kw_edit.setFocus()
+
+    @staticmethod
+    def _label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("muted")
+        return label
+
+    def _on_save(self) -> None:
+        s = style()
+        if len(self.kw_edit.text().strip()) < 2:
+            self.kw_edit.setPlaceholderText("키워드를 2자 이상 입력해주세요")
+            self.kw_edit.setStyleSheet(f"border: 1px solid {s.css(s.danger, 190)};")
+            self.kw_edit.setFocus()
+            return
+        if len(self.action_edit.toPlainText().strip()) < 2:
+            self.action_edit.setStyleSheet(f"border: 1px solid {s.css(s.danger, 190)};")
+            self.action_edit.setFocus()
+            return
+        self.accept()
+
+    def values(self) -> dict:
+        return {
+            "keywords": self.kw_edit.text().strip(),
+            "reminder_action": self.action_edit.toPlainText().strip(),
+            "sender_filter": self.sender_edit.text().strip(),
+        }
+
+
+class AwaitedEmailRow(SoftCard):
+    """One rule in the settings list: ON/OFF, text, delete."""
+
+    toggled = Signal(int, bool)
+    deleted = Signal(int)
+
+    def __init__(self, rule: dict, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.rule = rule
+        s = style()
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(s.card_pad + 2, s.card_pad, s.card_pad, s.card_pad)
+        outer.setSpacing(max(4, s.gap + 1))
+
+        self.enabled = QCheckBox()
+        self.enabled.setChecked(bool(rule.get("is_active", 1)))
+        self.enabled.setToolTip("감시 켜기 / 끄기")
+        self.enabled.toggled.connect(lambda v: self.toggled.emit(int(rule["id"]), v))
+        outer.addWidget(self.enabled, 0, Qt.AlignTop)
+
+        column = QVBoxLayout()
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(1)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(4)
+        title = ElidedLabel(rule.get("keywords", ""))
+        title.setStyleSheet(
+            f"color: {s.css(s.text)}; font-size: {s.f_md}px; font-weight: 600;")
+        top.addWidget(title, 1)
+        triggered = bool(rule.get("is_triggered"))
+        chip = TagChip("수신됨" if triggered else "대기 중",
+                       s.success if triggered else s.accent)
+        top.addWidget(chip, 0)
+        column.addLayout(top)
+
+        detail = (rule.get("reminder_action") or "").replace("\n", " / ")
+        if rule.get("sender_filter"):
+            detail = f"[{rule['sender_filter']}] {detail}"
+        body = QLabel(detail)
+        body.setWordWrap(True)
+        body.setStyleSheet(f"color: {s.css(s.text_dim)}; font-size: {s.f_xs}px;")
+        column.addWidget(body)
+        outer.addLayout(column, 1)
+
+        remove = IconButton("✕", "규칙 삭제", role="danger")
+        remove.clicked.connect(lambda: self.deleted.emit(int(rule["id"])))
+        outer.addWidget(remove, 0, Qt.AlignTop)
+
+
 class SettingsDialog(GlassDialog):
     """Live-previewing settings. Every change applies immediately;
     Cancel restores the snapshot taken when the dialog opened."""
@@ -2241,16 +2433,19 @@ class SettingsDialog(GlassDialog):
     reset_requested = Signal()
 
     def __init__(self, config: Config, parent: Optional[QWidget] = None,
-                 backend: Optional[dict] = None) -> None:
+                 backend: Optional[dict] = None, db: object = None) -> None:
         super().__init__(parent, "⚙  설정", width=372)
         self.config = config
         self.backend = backend or {}
+        self.db = db
         self._loading = True
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._appearance_tab(), "모양")
         self.tabs.addTab(self._behavior_tab(), "동작")
         self.tabs.addTab(self._ai_tab(), "AI")
+        if db is not None:
+            self.tabs.addTab(self._email_tab(), "이메일 감지")
         self.tabs.addTab(self._about_tab(), "정보")
         self.body.addWidget(self.tabs)
 
@@ -2385,6 +2580,9 @@ class SettingsDialog(GlassDialog):
         layout.addWidget(self._row("사용 중 배경", self._slider(
             20, 100, int(a["panel_alpha"] * 100), "%",
             lambda v: self._apply("appearance", "panel_alpha", v / 100))))
+        layout.addWidget(self._row("평소 카드", self._slider(
+            0, 100, int(a["idle_card_fade"] * 100), "%",
+            lambda v: self._apply("appearance", "idle_card_fade", v / 100))))
         note = QLabel("※ 글자는 항상 불투명하게 유지되어 배경만 투명해집니다.")
         note.setObjectName("muted")
         note.setWordWrap(True)
@@ -2526,6 +2724,97 @@ class SettingsDialog(GlassDialog):
         layout.addWidget(hint)
         layout.addStretch(1)
         return page
+
+    def _email_tab(self) -> QWidget:
+        """Visual management for awaited-email rules (previously chat-only)."""
+        page, layout = self._page()
+
+        header = QHBoxLayout()
+        header.setSpacing(4)
+        self.email_count = QLabel("")
+        self.email_count.setObjectName("muted")
+        header.addWidget(self.email_count)
+        header.addStretch(1)
+        add = QPushButton("＋ 규칙 추가")
+        add.setObjectName("primary")
+        add.setCursor(Qt.PointingHandCursor)
+        add.clicked.connect(self._add_email_rule)
+        header.addWidget(add)
+        layout.addLayout(header)
+
+        self.email_scroll = QScrollArea()
+        self.email_scroll.setWidgetResizable(True)
+        self.email_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.email_scroll.setFrameShape(QFrame.NoFrame)
+        self.email_scroll.viewport().setAutoFillBackground(False)
+        self.email_scroll.setMinimumHeight(150)
+
+        host = QWidget()
+        host.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.email_list = QVBoxLayout(host)
+        self.email_list.setContentsMargins(0, 0, 3, 0)
+        self.email_list.setSpacing(max(3, style().gap))
+        self.email_list.addStretch(1)
+        self.email_scroll.setWidget(host)
+        layout.addWidget(self.email_scroll, 1)
+
+        note = QLabel("체크를 끄면 감시만 멈추고 규칙은 남습니다. "
+                      "채팅에서 \"'키워드' 메일 오면 '할 일' 리마인드해줘\" 로도 등록됩니다.")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self._reload_email_rules()
+        return page
+
+    def _reload_email_rules(self) -> None:
+        while self.email_list.count() > 1:                # keep the stretch
+            item = self.email_list.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        try:
+            rules = self.db.list_awaited_emails(include_triggered=True)
+        except Exception:                                 # noqa: BLE001
+            rules = []
+        for index, rule in enumerate(rules):
+            row = AwaitedEmailRow(rule)
+            row.toggled.connect(self._toggle_email_rule)
+            row.deleted.connect(self._delete_email_rule)
+            self.email_list.insertWidget(index, row)
+        if not rules:
+            empty = QLabel("등록된 메일 감지 규칙이 없습니다.")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setObjectName("muted")
+            self.email_list.insertWidget(0, empty)
+        waiting = sum(1 for r in rules if not r["is_triggered"] and r["is_active"])
+        self.email_count.setText(f"규칙 {len(rules)}건 · 대기 중 {waiting}건")
+
+    def _add_email_rule(self) -> None:
+        dialog = AwaitedEmailDialog(self)
+        dialog.center_on(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        try:
+            self.db.add_awaited_email(values["keywords"], values["reminder_action"],
+                                      values["sender_filter"])
+        except Exception:                                 # noqa: BLE001
+            return
+        self._reload_email_rules()
+
+    def _toggle_email_rule(self, rule_id: int, active: bool) -> None:
+        try:
+            self.db.set_awaited_active(rule_id, active)
+        except Exception:                                 # noqa: BLE001
+            pass
+
+    def _delete_email_rule(self, rule_id: int) -> None:
+        try:
+            self.db.delete_awaited_email(rule_id)
+        except Exception:                                 # noqa: BLE001
+            pass
+        self._reload_email_rules()
 
     def _about_tab(self) -> QWidget:
         page, layout = self._page()

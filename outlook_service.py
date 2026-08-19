@@ -21,6 +21,12 @@ Design notes
   behave exactly as before when Outlook is simply not there.
 * **The matcher is pure.** :func:`match_rule` takes plain strings, so the
   matching rules are unit-tested without Outlook, COM, or Windows.
+* **Two-step scan, to stay silent.** Outlook's object-model guard pops
+  "전자 메일 주소 정보에 액세스하려는 프로그램이 있습니다" when a program reads
+  ``SenderName``/``SenderEmailAddress``. ``Subject`` and ``Body`` are exempt.
+  So the 10-second pass reads only subject/body (:func:`match_keywords`), and
+  the sender is resolved lazily for a single matched item
+  (:meth:`OutlookMonitorWorker._sender_of`) via MAPI property tags.
 
 Run ``py outlook_service.py`` for a self-test (matching logic always; a live
 one-shot inbox scan only if Outlook happens to be running).
@@ -53,6 +59,32 @@ BODY_SCAN_CHARS = 4000
 # Pure matching logic (no COM, no Qt)
 # --------------------------------------------------------------------------- #
 
+def match_keywords(rule: dict, subject: str, body: str = "") -> bool:
+    """Keyword half of a rule -- checked against subject/body only.
+
+    Split out from the sender check on purpose: ``Subject`` and ``Body`` are
+    safe to read for every message, while touching sender fields pops Outlook's
+    security dialog. See :meth:`OutlookMonitorWorker._poll_once`.
+    """
+    keywords = split_keywords(rule.get("keywords", ""))
+    if not keywords:
+        return False
+    haystack = f"{subject or ''}\n{(body or '')[:BODY_SCAN_CHARS]}".lower()
+    return any(word.lower() in haystack for word in keywords)
+
+
+def match_sender(rule: dict, sender_name: str = "", sender_email: str = "") -> bool:
+    """Sender half of a rule. No filter configured -> always passes.
+
+    Case-insensitive substring, so "팀장" matches "김팀장" and a bare domain
+    matches any address inside it.
+    """
+    sender_filter = (rule.get("sender_filter") or "").strip().lower()
+    if not sender_filter:
+        return True
+    return sender_filter in f"{sender_name or ''}\n{sender_email or ''}".lower()
+
+
 def match_rule(
     rule: dict,
     subject: str,
@@ -60,28 +92,10 @@ def match_rule(
     sender_name: str = "",
     sender_email: str = "",
 ) -> bool:
-    """Does this message satisfy an ``awaited_emails`` rule?
-
-    * keywords -- case-insensitive substring match against subject **or** body;
-      any one keyword is enough.
-    * sender_filter -- optional; when present it must also match the sender's
-      display name or address (case-insensitive substring, so "팀장" matches
-      "김팀장" and a bare domain matches any address inside it).
-    """
-    keywords = split_keywords(rule.get("keywords", ""))
-    if not keywords:
-        return False
-
-    haystack = f"{subject or ''}\n{(body or '')[:BODY_SCAN_CHARS]}".lower()
-    if not any(word.lower() in haystack for word in keywords):
-        return False
-
-    sender_filter = (rule.get("sender_filter") or "").strip().lower()
-    if sender_filter:
-        sender_blob = f"{sender_name or ''}\n{sender_email or ''}".lower()
-        if sender_filter not in sender_blob:
-            return False
-    return True
+    """Full match (keywords **and** sender). Convenience for tests/callers that
+    already hold every field."""
+    return (match_keywords(rule, subject, body)
+            and match_sender(rule, sender_name, sender_email))
 
 
 # --------------------------------------------------------------------------- #
@@ -296,13 +310,24 @@ class OutlookMonitorWorker(QObject):
             if not self._primed:
                 continue
 
+            # Step 1 -- cheap, silent scan. Subject and Body never trigger the
+            # Outlook security dialog; SenderName / SenderEmailAddress do, and
+            # asking for them on all 30 items every 10 seconds is exactly what
+            # made the prompt appear. So the routine pass reads neither.
             subject = self._safe(item, "Subject", "")
-            sender_name = self._safe(item, "SenderName", "")
-            sender_email = self._safe(item, "SenderEmailAddress", "")
             body = self._safe(item, "Body", "")[:BODY_SCAN_CHARS]
 
-            for rule in rules:
-                if not match_rule(rule, subject, body, sender_name, sender_email):
+            candidates = [r for r in rules if match_keywords(r, subject, body)]
+            if not candidates:
+                continue
+
+            # Step 2 -- a keyword hit. Now (and only now, for this one item)
+            # resolve the sender, preferring MAPI property tags which are not
+            # gated by the object-model guard.
+            sender_name, sender_email = self._sender_of(item)
+
+            for rule in candidates:
+                if not match_sender(rule, sender_name, sender_email):
                     continue
                 rule_id = int(rule["id"])
                 log.info("Awaited mail matched rule #%d: %r from %r",
@@ -359,6 +384,46 @@ class OutlookMonitorWorker(QObject):
             except Exception as exc:                             # noqa: BLE001
                 log.warning("Inbox enumeration failed: %s", exc)
         return collected
+
+    #: MAPI property tags read through PropertyAccessor. These are not covered
+    #: by the Outlook object-model guard that protects SenderName /
+    #: SenderEmailAddress, so they resolve the sender without a prompt.
+    PROP_SENDER_NAME = "http://schemas.microsoft.com/mapi/proptag/0x0C1A001E"
+    PROP_SENDER_EMAIL = "http://schemas.microsoft.com/mapi/proptag/0x0C1F001E"
+
+    def _sender_of(self, item: Any) -> tuple[str, str]:
+        """Resolve (name, email) for one matched item, quietly if possible.
+
+        PropertyAccessor first; if it raises (older Outlook, protected item,
+        or a policy that blocks it too) fall back to the plain attributes. The
+        fallback may show the security dialog, but by then it happens once for
+        a real hit rather than 30 times a poll.
+        """
+        name = email = ""
+        accessor = None
+        try:
+            accessor = item.PropertyAccessor
+        except Exception:                                        # noqa: BLE001
+            accessor = None
+
+        if accessor is not None:
+            for tag, slot in ((self.PROP_SENDER_NAME, "name"),
+                              (self.PROP_SENDER_EMAIL, "email")):
+                try:
+                    value = accessor.GetProperty(tag)
+                    if value:
+                        if slot == "name":
+                            name = str(value)
+                        else:
+                            email = str(value)
+                except Exception:                                # noqa: BLE001
+                    log.debug("PropertyAccessor %s unavailable", slot, exc_info=True)
+
+        if not name:
+            name = self._safe(item, "SenderName", "")
+        if not email:
+            email = self._safe(item, "SenderEmailAddress", "")
+        return name, email
 
     @staticmethod
     def _safe(item: Any, attribute: str, default: str = "") -> str:
@@ -479,6 +544,70 @@ def _selftest() -> None:  # pragma: no cover
 
     long_body = "x" * (BODY_SCAN_CHARS + 500) + "특약OS이월"
     check(not match_rule(rule, "제목", long_body), "body scan is bounded")
+
+    print("\n--- 2-step scan: no sender access without a keyword hit ---")
+
+    class GuardedMail:
+        """Mimics Outlook's object-model guard: reading sender fields raises,
+        as if the user had clicked 'deny' on the security dialog."""
+
+        def __init__(self, entry, subject, body="", name="", email=""):
+            self.EntryID = entry
+            self.Subject = subject
+            self.Body = body
+            self._name, self._email = name, email
+            self.touched: list[str] = []
+
+        def __getattr__(self, attribute):
+            if attribute in ("SenderName", "SenderEmailAddress"):
+                object.__getattribute__(self, "touched").append(attribute)
+                raise RuntimeError("security dialog / access denied")
+            raise AttributeError(attribute)
+
+        @property
+        def PropertyAccessor(self):                              # noqa: N802
+            outer = self
+
+            class Accessor:
+                def GetProperty(self, tag):                      # noqa: N802
+                    outer.touched.append("PropertyAccessor")
+                    if tag.endswith("0x0C1A001E"):
+                        return outer._name
+                    if tag.endswith("0x0C1F001E"):
+                        return outer._email
+                    raise RuntimeError("unknown tag")
+            return Accessor()
+
+    worker = OutlookMonitorWorker(type("Db", (), {
+        "get_active_awaited_emails": lambda self: [dict(rule)],
+        "mark_email_triggered": lambda self, rid: None,
+    })(), interval_seconds=3)
+    worker._connect = lambda: True
+    worker._primed = True
+
+    class Items:
+        def __init__(self, mails):
+            self._m = mails
+        Count = property(lambda self: len(self._m))
+        def Sort(self, *a): pass
+        def Restrict(self, q): raise RuntimeError("unsupported")
+        def Item(self, i): return self._m[i - 1]
+
+    boring = GuardedMail("N1", "점심 메뉴 안내", "관계 없는 본문", "김대리", "kim@x.com")
+    worker._inbox = type("Inbox", (), {"Items": Items([boring])})()
+    fired: list = []
+    worker.email_matched.connect(lambda *a: fired.append(a))
+    worker._poll_once()
+    check(boring.touched == [], f"non-matching mail: sender untouched ({boring.touched})")
+    check(not fired, "non-matching mail did not fire")
+
+    hit = GuardedMail("N2", "[공지] 특약OS이월 처리", "본문", "김팀장", "boss@koreanre.co.kr")
+    worker._inbox = type("Inbox", (), {"Items": Items([hit])})()
+    worker._poll_once()
+    check("PropertyAccessor" in hit.touched, "matching mail: sender read via PropertyAccessor")
+    check("SenderName" not in hit.touched,
+          f"guarded attribute never used when PropertyAccessor works ({hit.touched})")
+    check(len(fired) == 1 and fired[0][2] == "김팀장", f"sender resolved: {fired and fired[0][2]}")
 
     print("\n--- controller lifecycle (no Outlook needed) ---")
     from PySide6.QtCore import QCoreApplication

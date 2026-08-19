@@ -55,6 +55,10 @@ DEFAULTS: dict[str, Any] = {
         "idle_panel_alpha": 0.42,   # panel fill opacity when idle  (see-through)
         "idle_opacity": 0.72,       # whole-window opacity when idle
         "hover_opacity": 1.0,       # whole-window opacity when hovered/focused
+        # Inner cards (schedule rows, chat bubbles) keep their own dark fill,
+        # which at rest read as solid blocks over a bright desktop. This is the
+        # multiplier applied to those fills when idle -> true ghost HUD.
+        "idle_card_fade": 0.18,
         "show_seconds": True,
         "show_summary": True,
         "show_countdown": True,
@@ -336,6 +340,7 @@ class Config:
         # 0.35 floor: below this, even pure white text stops being readable.
         a["idle_opacity"] = round(_clamp(a.get("idle_opacity"), 0.35, 1.0, 0.72), 2)
         a["hover_opacity"] = round(_clamp(a.get("hover_opacity"), 0.60, 1.0, 1.0), 2)
+        a["idle_card_fade"] = round(_clamp(a.get("idle_card_fade"), 0.0, 1.0, 0.18), 2)
         for flag in ("show_seconds", "show_summary", "show_countdown", "shadow"):
             a[flag] = bool(a.get(flag, True))
 
@@ -421,6 +426,8 @@ class Style:
     f_lg: int = 14
 
     # flags ---------------------------------------------------------------
+    #: Multiplier applied to inner-card fills while the HUD is idle.
+    idle_card_fade: float = 0.18
     is_light: bool = False
     shadow: bool = True
     show_seconds: bool = True
@@ -501,6 +508,7 @@ def build_style(config: Config) -> Style:
         f_sm=px(11),
         f_md=px(12),
         f_lg=px(14),
+        idle_card_fade=float(a["idle_card_fade"]),
         is_light=theme["is_light"],
         shadow=bool(a["shadow"]),
         show_seconds=bool(a["show_seconds"]),

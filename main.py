@@ -419,8 +419,13 @@ class HudWindow(QWidget):
         if restyle:
             self.apply_theme()
 
+        # setWindowFlag() re-creates the native window and hides it, so the
+        # visibility check has to happen BEFORE the call. Testing it afterwards
+        # always saw False and never re-showed -- toggling 항상 위에 표시 made
+        # the HUD vanish until the tray icon was clicked.
+        was_visible = self.isVisible()
         self.setWindowFlag(Qt.WindowStaysOnTopHint, bool(cfg.window["always_on_top"]))
-        if self.isVisible():
+        if was_visible and not self.isVisible():
             self.show()
 
         self.sound.set_volume(float(cfg.behavior["sound_volume"]))
@@ -433,7 +438,7 @@ class HudWindow(QWidget):
     def open_settings(self) -> None:
         snapshot = {k: dict(v) if isinstance(v, dict) else v
                     for k, v in self.config.data.items()}
-        dialog = SettingsDialog(self.config, self, backend=backend_info())
+        dialog = SettingsDialog(self.config, self, backend=backend_info(), db=self.db)
         dialog.preview_requested.connect(lambda: self.apply_settings(restyle=True))
         dialog.reset_requested.connect(self._reset_settings)
         dialog.center_on(self)
