@@ -27,6 +27,7 @@ import copy
 import json
 import logging
 import os
+import shutil
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -36,6 +37,125 @@ log = logging.getLogger(__name__)
 
 CONFIG_VERSION = 1
 CONFIG_FILENAME = "config.json"
+
+#: Everything the user would hate to lose. Lives in the data directory, which
+#: is deliberately *outside* the program folder so the whole program folder can
+#: be overwritten to upgrade.
+USER_DATA_FILES = ("schedules.db", "chat_history.db", CONFIG_FILENAME)
+USER_DATA_DIRS = ("logs", "backups", "models")
+
+#: Drop a file with this name next to the executable to pin the data directory
+#: somewhere else (one line: the path). Useful for a shared drive or a USB.
+DATA_DIR_POINTER = "datadir.txt"
+DATA_DIR_ENV = "OFFLINESMARTHUD_DATA"
+APP_FOLDER_NAME = "OfflineSmartHUD"
+
+
+def default_data_dir() -> str:
+    """``%LOCALAPPDATA%\\OfflineSmartHUD`` (never roams, never synced)."""
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if not base:
+        base = os.path.expanduser("~")
+    return os.path.join(base, APP_FOLDER_NAME)
+
+
+def resolve_data_dir(app_dir: str, argv: Optional[list[str]] = None) -> str:
+    """Decide where user data lives.
+
+    Order: ``--data-dir`` > environment variable > ``datadir.txt`` next to the
+    executable > ``%LOCALAPPDATA%``. Falls back to the program folder only if
+    the chosen location cannot be created, so the app still starts on a
+    locked-down machine instead of dying.
+    """
+    argv = list(argv if argv is not None else [])
+    chosen = ""
+
+    if "--data-dir" in argv:
+        index = argv.index("--data-dir")
+        if index + 1 < len(argv):
+            chosen = argv[index + 1]
+    if not chosen:
+        chosen = os.environ.get(DATA_DIR_ENV, "").strip()
+    if not chosen:
+        pointer = os.path.join(app_dir, DATA_DIR_POINTER)
+        if os.path.isfile(pointer):
+            try:
+                with open(pointer, "r", encoding="utf-8-sig") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            chosen = line
+                            break
+            except OSError as exc:
+                log.warning("Could not read %s: %s", DATA_DIR_POINTER, exc)
+    if not chosen:
+        chosen = default_data_dir()
+
+    chosen = os.path.abspath(os.path.expandvars(os.path.expanduser(chosen)))
+    try:
+        os.makedirs(chosen, exist_ok=True)
+        probe = os.path.join(chosen, ".writable")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("ok")
+        os.remove(probe)
+        return chosen
+    except OSError as exc:
+        log.warning("Data dir %s unusable (%s); falling back to the app folder",
+                    chosen, exc)
+        return app_dir
+
+
+def migrate_legacy_data(app_dir: str, data_dir: str) -> list[str]:
+    """Move data from an old install that kept everything beside the exe.
+
+    Copies rather than moves, and never overwrites anything already in the new
+    location, so running an old build afterwards still finds its data and a
+    half-finished migration cannot destroy the original. Returns what moved.
+    """
+    if os.path.abspath(app_dir) == os.path.abspath(data_dir):
+        return []
+    moved: list[str] = []
+
+    for name in USER_DATA_FILES:
+        source, target = os.path.join(app_dir, name), os.path.join(data_dir, name)
+        if os.path.isfile(source) and not os.path.exists(target):
+            try:
+                shutil.copy2(source, target)
+                moved.append(name)
+            except OSError as exc:
+                log.warning("Could not migrate %s: %s", name, exc)
+
+    for name in USER_DATA_DIRS:
+        source, target = os.path.join(app_dir, name), os.path.join(data_dir, name)
+        if not os.path.isdir(source) or os.path.isdir(target):
+            continue
+        try:
+            # models/ can hold multi-GB weights; copying would double the disk
+            # use for no benefit, so it is left where it is and found by the
+            # existing app-dir fallback in llm_engine.find_model_path().
+            if name == "models":
+                continue
+            shutil.copytree(source, target)
+            moved.append(name + "/")
+        except OSError as exc:
+            log.warning("Could not migrate %s: %s", name, exc)
+
+    if moved:
+        log.info("Migrated legacy data from %s -> %s: %s",
+                 app_dir, data_dir, ", ".join(moved))
+        try:
+            with open(os.path.join(app_dir, "DATA_MOVED.txt"), "w",
+                      encoding="utf-8-sig") as handle:
+                handle.write(
+                    "이 폴더의 데이터는 아래 위치로 복사되었습니다.\n\n"
+                    f"    {data_dir}\n\n"
+                    "이제 프로그램 폴더(이 폴더)는 통째로 덮어써도 됩니다.\n"
+                    "일정·메일 규칙·설정·로그는 위 폴더에 있습니다.\n\n"
+                    "원본은 지우지 않았습니다. 새 위치에서 정상 동작을 확인한 뒤\n"
+                    "이 폴더의 .db 파일은 삭제하셔도 됩니다.\n")
+        except OSError:
+            pass
+    return moved
 
 
 # --------------------------------------------------------------------------- #

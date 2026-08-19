@@ -59,10 +59,18 @@ from PySide6.QtWidgets import (
 )
 
 import crash_handler
-from config import Config, build_style, set_style, style
+from config import (
+    Config,
+    build_style,
+    migrate_legacy_data,
+    resolve_data_dir,
+    set_style,
+    style,
+)
 from crash_handler import guard
 from db_manager import REPEAT_NONE, WEEKDAY_NAMES_KO, DatabaseManager, Schedule
 from llm_engine import (
+    set_data_dir,
     TOOL_ADD,
     TOOL_ADD_EMAIL,
     TOOL_CLEAR,
@@ -1371,11 +1379,23 @@ def main() -> int:
     # a negligible cost to throughput.
     sys.setswitchinterval(0.002)
 
-    crash_handler.setup_logging(base, verbose="--debug" in argv)
-    crash_handler.install(base, APP_NAME)
+    # User data lives OUTSIDE the program folder so the whole program folder
+    # can be replaced to upgrade. On a locked-down machine the user cannot run
+    # an upgrade script, so "delete folder, paste new folder" has to be safe.
+    data = resolve_data_dir(base, argv)
+    migrated = migrate_legacy_data(base, data)
+    set_data_dir(data)          # models/ is looked up here first, then beside the exe
+
+    crash_handler.setup_logging(data, verbose="--debug" in argv)
+    crash_handler.install(data, APP_NAME)
     log.info("=" * 58)
     log.info("Offline Smart HUD starting (python %s, frozen=%s)",
              sys.version.split()[0], getattr(sys, "frozen", False))
+    log.info("Program folder: %s", base)
+    log.info("Data folder   : %s%s", data, "  (same as program folder)"
+             if os.path.abspath(data) == os.path.abspath(base) else "")
+    if migrated:
+        log.info("Migrated from the old layout: %s", ", ".join(migrated))
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
@@ -1390,7 +1410,7 @@ def main() -> int:
 
     # ---- config ---- #
     try:
-        config = Config.load(base)
+        config = Config.load(data)
         if "--reset-config" in argv:
             config.reset()
             config.save()
@@ -1406,7 +1426,7 @@ def main() -> int:
             log.info("Safe mode enabled")
     except Exception:                                    # noqa: BLE001
         log.exception("Config load failed; using defaults")
-        config = Config(base)
+        config = Config(data)
 
     set_style(build_style(config))
     app.setStyleSheet(build_stylesheet())
@@ -1415,7 +1435,9 @@ def main() -> int:
     # ---- single instance ---- #
     from PySide6.QtCore import QLockFile
 
-    lock = QLockFile(os.path.join(base, f"{APP_NAME}.lock"))
+    # Lock in the data dir: two copies of the program folder must still count
+    # as one instance, since they share the same database.
+    lock = QLockFile(os.path.join(data, f"{APP_NAME}.lock"))
     lock.setStaleLockTime(30_000)
     if not lock.tryLock(150):
         QMessageBox.information(
@@ -1425,16 +1447,16 @@ def main() -> int:
 
     # ---- database ---- #
     try:
-        db = DatabaseManager(base)
+        db = DatabaseManager(data)
     except Exception as exc:                             # noqa: BLE001
         return _fatal("데이터베이스를 열 수 없습니다.",
-                      f"{exc}\n\n위치: {base}\n폴더 쓰기 권한을 확인해주세요.")
+                      f"{exc}\n\n위치: {data}\n폴더 쓰기 권한을 확인해주세요.")
 
     # Daily snapshot before anything touches the data. Schedules and mail rules
     # live next to the executable, so a careless folder-replace upgrade would
     # otherwise take them with it. Cheap (a few hundred KB) and never fatal.
     if config.behavior.get("backup_on_start", True):
-        db.backup_to(os.path.join(base, "backups"),
+        db.backup_to(os.path.join(data, "backups"),
                      keep=int(config.behavior.get("backup_keep_days", 10)))
 
     # ---- window ---- #

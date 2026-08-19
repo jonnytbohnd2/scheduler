@@ -243,24 +243,35 @@ Deploying to the air-gapped machine:
 2. Drop the `.gguf` file into `OfflineSmartHUD/models/`
 3. Run `OfflineSmartHUD.exe`
 
-### Upgrading an existing install
+### Upgrading: replace the program folder, keep the data
 
-The databases live **next to the executable**, so replacing the folder wholesale
-destroys the user's schedules and mail rules. Every build ships an
-`upgrade.ps1` that does it safely — run it from the *new* folder:
+Program and data are separate directories, so upgrading is "delete the folder,
+paste the new one" with nothing to preserve by hand — which matters on a
+locked-down machine where no script can be run.
 
-```powershell
-.\upgrade.ps1 -Target "C:\path\to\installed\OfflineSmartHUD"
+```
+<anywhere>\OfflineSmartHUD\        program  - replace freely
+%LOCALAPPDATA%\OfflineSmartHUD\    data     - schedules, rules, config, logs,
+                                              backups, models
 ```
 
-It stops the app, snapshots the data to `backups/pre-upgrade-<ts>/`, replaces
-`OfflineSmartHUD.exe` and `_internal/` (deleting the old `_internal` first so
-stale files from the previous version cannot linger), and leaves
-`schedules.db`, `chat_history.db`, `config.json`, `logs/` and `models/` alone.
+Resolution order for the data directory: `--data-dir` → `OFFLINESMARTHUD_DATA`
+→ a `datadir.txt` beside the exe (one line, a path) → `%LOCALAPPDATA%`. If the
+chosen location cannot be written, it falls back to the program folder rather
+than refusing to start.
 
-As a second line of defence the app snapshots both databases into
-`backups/<date>/` on every start (10 days retained, `backup_on_start` in
-config.json).
+**Migration is automatic.** An install from before the split keeps its data
+next to the exe; the first run of a new build copies it across and drops a
+`DATA_MOVED.txt` in the old folder. It copies rather than moves, so an older
+build still works and a half-finished migration cannot lose anything.
+
+`models/` is *not* copied — multi-GB weights would double the disk use, and the
+old location stays on the search path.
+
+Two further safety nets: the app snapshots both databases to
+`backups/<date>/` on every start (10 days, SQLite online-backup API rather than
+a file copy, which WAL makes unsafe), and every build ships `upgrade.ps1` for
+installs that still keep data beside the exe.
 
 The build generates its own icon and notification chime from code, so there
 are no binary art assets to ship.

@@ -84,20 +84,45 @@ def app_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+#: Set by main() once the data directory is known, so a multi-GB model can live
+#: outside the program folder and survive a folder-replace upgrade.
+_DATA_DIR: Optional[str] = None
+
+
+def set_data_dir(path: str) -> None:
+    global _DATA_DIR
+    _DATA_DIR = path or None
+
+
 def models_dir() -> str:
-    return os.path.join(app_dir(), "models")
+    """Preferred models folder: the data dir if one is set, else beside the exe."""
+    return os.path.join(_DATA_DIR or app_dir(), "models")
+
+
+def model_search_dirs() -> list[str]:
+    """Every folder searched for weights, in priority order.
+
+    The data dir wins, but the program folder is still searched so an existing
+    install (and any build that ships a model inside it) keeps working.
+    """
+    dirs = []
+    for candidate in (models_dir(), os.path.join(app_dir(), "models")):
+        if candidate not in dirs:
+            dirs.append(candidate)
+    return dirs
 
 
 def list_models() -> list[str]:
-    """Every ``*.gguf`` in ``models/``, newest first."""
-    directory = models_dir()
-    if not os.path.isdir(directory):
-        return []
-    found = [
-        os.path.join(directory, name)
-        for name in os.listdir(directory)
-        if name.lower().endswith(".gguf")
-    ]
+    """Every ``*.gguf`` across the search dirs, newest first."""
+    found: list[str] = []
+    for directory in model_search_dirs():
+        if not os.path.isdir(directory):
+            continue
+        found += [
+            os.path.join(directory, name)
+            for name in os.listdir(directory)
+            if name.lower().endswith(".gguf")
+        ]
     try:
         found.sort(key=os.path.getmtime, reverse=True)
     except OSError:
@@ -118,9 +143,11 @@ def find_model_path(configured: str = "") -> Optional[str]:
     holds several.
     """
     if configured:
-        candidate = configured if os.path.isabs(configured) else os.path.join(app_dir(), configured)
-        if os.path.isfile(candidate):
-            return os.path.abspath(candidate)
+        roots = [""] if os.path.isabs(configured) else [_DATA_DIR or "", app_dir()]
+        for root in roots:
+            candidate = configured if not root else os.path.join(root, configured)
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
         log.warning("Configured model_path not found, falling back: %s", configured)
 
     found = list_models()

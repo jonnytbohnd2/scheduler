@@ -355,40 +355,70 @@ logs\faulthandler.log     프로그램이 강제 종료된 경우의 흔적
 
 ---
 
-## 10. 새 버전으로 업그레이드 (데이터 보존)
+## 10. 새 버전으로 업그레이드
 
-**중요:** 일정·메일 규칙·설정은 `OfflineSmartHUD.exe` **바로 옆**에 저장됩니다.
-새 빌드 폴더로 **통째로 덮어쓰면 전부 사라집니다.**
+**프로그램 폴더와 데이터 폴더가 분리되어 있습니다.
+그래서 프로그램 폴더는 통째로 덮어써도 됩니다.**
 
-### 안전한 방법 — 동봉된 스크립트
-새 빌드 폴더에서 PowerShell을 열고:
+```
+C:\FTC_downloads\OfflineSmartHUD\        ← 프로그램. 통째로 교체 OK
+    OfflineSmartHUD.exe
+    _internal\
+    datadir.txt                          ← 데이터 위치를 적어두는 파일(선택)
 
-```powershell
-.\upgrade.ps1 -Target "C:\FTC_downloads\OfflineSmartHUD"
+%LOCALAPPDATA%\OfflineSmartHUD\          ← 데이터. 절대 안 지워짐
+    schedules.db          일정 + 메일 감지 규칙
+    chat_history.db       대화 기록
+    config.json           설정
+    logs\                 로그
+    backups\<날짜>\       DB 자동 스냅샷 (최근 10일)
+    models\               AI 모델 (.gguf) - 여기 두면 업그레이드해도 안 지워짐
 ```
 
-스크립트가 하는 일:
-1. 실행 중인 앱을 종료
-2. 기존 DB·설정을 `backups\pre-upgrade-<시각>\` 에 복사
-3. `OfflineSmartHUD.exe` 와 `_internal` 만 교체 (`_internal`은 통째로 갈아끼워
-   이전 버전 잔여 파일을 남기지 않습니다)
-4. **일정 DB · 메일 감지 규칙 · 대화 기록 · 설정 · 로그 · 모델은 그대로 유지**
+`%LOCALAPPDATA%` 는 보통 `C:\Users\<사번>\AppData\Local` 입니다.
+탐색기 주소창에 `%LOCALAPPDATA%\OfflineSmartHUD` 를 붙여넣으면 바로 열립니다.
 
-대상 폴더가 설치 폴더가 아니거나, 원본과 대상이 같으면 아무것도 하지 않고 멈춥니다.
+### 업그레이드 방법
+1. 기존 `OfflineSmartHUD` **폴더를 지우거나** 새 폴더로 덮어씁니다
+2. 실행합니다
 
-### 수동으로 한다면
-새 폴더에서 이 둘만 복사하세요. 나머지는 건드리지 마세요.
+끝입니다. 일정·메일 규칙·설정·로그는 데이터 폴더에 있어서 영향받지 않습니다.
 
-| 교체할 것 | 절대 덮어쓰면 안 되는 것 |
+### 기존 설치본에서 처음 올릴 때
+예전 버전은 데이터를 exe 옆에 뒀습니다. 새 버전을 처음 실행하면 그 데이터를
+데이터 폴더로 **자동 복사**하고, 옛 폴더에 `DATA_MOVED.txt` 를 남깁니다.
+원본은 지우지 않으니 정상 동작을 확인한 뒤 예전 `.db` 파일을 삭제하세요.
+
+> 그러니 **처음 한 번은** 옛 폴더를 지우기 전에 새 exe 를 한 번 실행해 주세요.
+> (이미 지웠다면 옛 `schedules.db` 를 데이터 폴더에 넣어주면 됩니다.)
+
+### 데이터 폴더를 다른 곳에 두고 싶다면
+`OfflineSmartHUD.exe` 옆에 `datadir.txt` 를 만들고 경로 한 줄만 적으세요.
+
+```
+D:\내문서\OfflineSmartHUD_Data
+```
+
+명령행이 되는 환경이라면 `--data-dir "경로"` 또는 환경변수
+`OFFLINESMARTHUD_DATA` 도 같은 역할을 합니다.
+
+### 그래도 폴더를 통째로 옮겨야 한다면 — 백업할 파일
+데이터 폴더에서 이 3개만 챙기면 전부 복구됩니다.
+
+| 파일 | 내용 |
 |---|---|
-| `OfflineSmartHUD.exe` | `schedules.db` (일정 + 메일 규칙) |
-| `_internal\` (기존 것 삭제 후 복사) | `chat_history.db`, `config.json` |
-| | `models\`, `logs\`, `backups\` |
+| `schedules.db` | **일정 + 기다리는 메일 규칙** (제일 중요) |
+| `config.json` | 설정 (테마·투명도·알림) |
+| `chat_history.db` | 대화 기록 (없어도 무방) |
 
 ### 자동 백업
-앱은 시작할 때마다 두 DB의 스냅샷을 `backups\<날짜>\` 에 남깁니다(최근 10일 보관).
-실수로 덮어썼더라도 여기서 `schedules.db` 를 되돌리면 복구됩니다.
-`설정 → config.json` 의 `backup_on_start`, `backup_keep_days` 로 조절합니다.
+앱은 시작할 때마다 두 DB의 스냅샷을 `backups\<날짜>\` 에 남깁니다(최근 10일).
+사고가 나도 여기서 `schedules.db` 를 되돌리면 복구됩니다.
+`config.json` 의 `backup_on_start`, `backup_keep_days` 로 조절합니다.
+
+### upgrade.ps1 (명령행이 되는 환경용)
+데이터를 여전히 exe 옆에 두고 쓰는 경우를 위해 스크립트도 동봉되어 있습니다.
+`.\upgrade.ps1 -Target "<설치폴더>"` — 폴더 분리를 쓰신다면 필요 없습니다.
 
 ---
 
