@@ -221,6 +221,18 @@ DEFAULTS: dict[str, Any] = {
         "nag_enabled": True,
         "nag_minutes": 10,
         "nag_max_count": 3,
+        # Hold alarms outside working hours -- nobody acts on 특약OS이월 at
+        # 22:40, and a chime at dinner is just noise. Off by default: it is
+        # a surprising behaviour to inherit without asking for it.
+        "quiet_enabled": False,
+        "work_start": "09:00",
+        "work_end": "18:00",
+        "quiet_skip_lunch": False,
+        "lunch_start": "12:00",
+        "lunch_end": "13:00",
+        "quiet_skip_holidays": True,
+        # Read-only glance at the Outlook calendar.
+        "calendar_enabled": True,
     },
     "llm": {
         "model_path": "",           # empty -> auto-discover in models/
@@ -351,6 +363,18 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             out[key] = value
     return out
+
+
+def _clean_hhmm(value: Any, fallback: str) -> str:
+    """Normalise a 'HH:MM' setting; anything unparseable reverts to default."""
+    try:
+        hours, _, mins = str(value).partition(":")
+        h, m = int(hours), int(mins or 0)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return f"{h:02d}:{m:02d}"
+    except (TypeError, ValueError):
+        pass
+    return fallback
 
 
 def _clamp(value: Any, low: float, high: float, fallback: float) -> float:
@@ -503,6 +527,13 @@ class Config:
         b["nag_enabled"] = bool(b.get("nag_enabled", True))
         b["nag_minutes"] = int(_clamp(b.get("nag_minutes"), 1, 180, 10))
         b["nag_max_count"] = int(_clamp(b.get("nag_max_count"), 1, 20, 3))
+        b["quiet_enabled"] = bool(b.get("quiet_enabled", False))
+        b["quiet_skip_lunch"] = bool(b.get("quiet_skip_lunch", False))
+        b["quiet_skip_holidays"] = bool(b.get("quiet_skip_holidays", True))
+        b["calendar_enabled"] = bool(b.get("calendar_enabled", True))
+        for key, fallback in (("work_start", "09:00"), ("work_end", "18:00"),
+                              ("lunch_start", "12:00"), ("lunch_end", "13:00")):
+            b[key] = _clean_hhmm(b.get(key), fallback)
 
         m["n_ctx"] = int(_clamp(m.get("n_ctx"), 512, 32768, 4096))
         m["n_threads"] = int(_clamp(m.get("n_threads"), 0, 128, 0))

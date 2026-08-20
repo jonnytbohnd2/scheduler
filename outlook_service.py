@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from PySide6.QtCore import QMetaObject, QObject, Qt, QThread, QTimer, Signal, Slot
@@ -46,6 +47,7 @@ log = logging.getLogger(__name__)
 
 #: ``olFolderInbox`` from the Outlook object model.
 OL_FOLDER_INBOX = 6
+OL_FOLDER_CALENDAR = 9
 
 DEFAULT_INTERVAL_S = 10
 #: How many of the newest inbox items to inspect per poll. Reading properties
@@ -102,6 +104,22 @@ def match_rule(
 # Worker (runs on OutlookThread)
 # --------------------------------------------------------------------------- #
 
+def _as_datetime(value: Any) -> Optional[datetime]:
+    """pywin32 hands back its own time type; normalise or give up."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    try:
+        return datetime.fromtimestamp(float(value.timestamp()))
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        return datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
 class OutlookMonitorWorker(QObject):
     """Owns the COM connection. Every slot here executes off the GUI thread."""
 
@@ -109,12 +127,21 @@ class OutlookMonitorWorker(QObject):
     email_matched = Signal(int, str, str, str)
     #: (available, human-readable reason)
     service_status = Signal(bool, str)
+    #: Today's calendar entries as plain dicts -- no COM objects cross threads.
+    meetings_updated = Signal(list)
+
+    #: Calendars move slowly; no point paying COM every 10 s for one.
+    CALENDAR_REFRESH_S = 300
 
     def __init__(self, db, interval_seconds: int = DEFAULT_INTERVAL_S,
                  scan_limit: int = DEFAULT_SCAN_LIMIT,
-                 allow_launch: bool = False) -> None:
+                 allow_launch: bool = False,
+                 calendar_enabled: bool = True) -> None:
         super().__init__()
         self.db = db
+        self.calendar_enabled = bool(calendar_enabled)
+        self._meetings: list[dict] = []
+        self._meetings_at: Optional[datetime] = None
         self.interval_seconds = max(3, int(interval_seconds))
         self.scan_limit = max(1, int(scan_limit))
         #: Start Outlook if it is closed. Off by default -- see :meth:`_connect`.
@@ -124,6 +151,7 @@ class OutlookMonitorWorker(QObject):
         self._com_ready = False
         self._outlook: Any = None
         self._inbox: Any = None
+        self._namespace: Any = None
         self._available = False
         self._last_status: Optional[tuple[bool, str]] = None
         self._busy = threading.Event()
@@ -221,15 +249,68 @@ class OutlookMonitorWorker(QObject):
             inbox = namespace.GetDefaultFolder(OL_FOLDER_INBOX)
             _ = inbox.Name                                       # force a real call
         except Exception as exc:                                 # noqa: BLE001
-            self._outlook = self._inbox = None
+            self._outlook = self._inbox = self._namespace = None
             self._emit_status(False, self._explain(exc))
             log.debug("Outlook COM unavailable: %s", exc)
             return False
 
         self._outlook, self._inbox = outlook, inbox
+        self._namespace = namespace
         self._emit_status(True, "Outlook 연결됨")
         log.info("Connected to Outlook inbox")
         return True
+
+    def todays_meetings(self, when: Optional[datetime] = None,
+                        limit: int = 12) -> list[dict]:
+        """Today's calendar entries, read-only.
+
+        Deliberately reads Subject / Start / End / Location / AllDayEvent and
+        nothing else. Organiser and attendee fields are the ones behind
+        Outlook's "a program is trying to access e-mail addresses" dialog --
+        the same trap the sender lookup fell into -- and a HUD showing what is
+        on today has no use for them.
+        """
+        if not self._connect():
+            return []
+        day = (when or datetime.now()).replace(hour=0, minute=0, second=0,
+                                               microsecond=0)
+        tomorrow = day + timedelta(days=1)
+        try:
+            folder = self._namespace.GetDefaultFolder(OL_FOLDER_CALENDAR)
+            items = folder.Items
+            # Both are required for recurring meetings to appear as instances
+            # rather than as their master entry.
+            items.IncludeRecurrences = True
+            items.Sort("[Start]")
+            items = items.Restrict(
+                f"[Start] < '{tomorrow.strftime('%m/%d/%Y %H:%M %p')}' AND "
+                f"[End] > '{day.strftime('%m/%d/%Y %H:%M %p')}'")
+        except Exception as exc:                                 # noqa: BLE001
+            log.debug("Calendar read failed: %s", exc)
+            return []
+
+        out: list[dict] = []
+        try:
+            for item in items:
+                if len(out) >= limit:
+                    break
+                try:
+                    start = _as_datetime(getattr(item, "Start", None))
+                    if start is None:
+                        continue
+                    out.append({
+                        "subject": self._safe(item, "Subject", "(제목 없음)"),
+                        "start": start,
+                        "end": _as_datetime(getattr(item, "End", None)),
+                        "location": self._safe(item, "Location", ""),
+                        "all_day": bool(getattr(item, "AllDayEvent", False)),
+                    })
+                except Exception:                                # noqa: BLE001
+                    continue                                     # skip odd items
+        except Exception as exc:                                 # noqa: BLE001
+            log.debug("Calendar iteration failed: %s", exc)
+        out.sort(key=lambda r: r["start"])
+        return out
 
     #: HRESULT -> message. pywin32 puts the code in ``exc.args[0]`` as a signed
     #: int and localises ``str(exc)``, so matching on text is unreliable on a
@@ -279,6 +360,7 @@ class OutlookMonitorWorker(QObject):
         self._busy.set()
         try:
             self._poll_once()
+            self._refresh_meetings()
         except Exception as exc:                                 # noqa: BLE001
             # A poll must never kill the timer.
             log.exception("Outlook poll failed")
@@ -286,6 +368,27 @@ class OutlookMonitorWorker(QObject):
             self._emit_status(False, self._explain(exc))
         finally:
             self._busy.clear()
+
+    def _refresh_meetings(self) -> None:
+        """Re-read today's calendar, but rarely.
+
+        The inbox needs a 10-second cadence to catch an awaited mail; a
+        calendar does not change that fast, and every read is cross-process
+        COM traffic. Refresh every few minutes, and immediately once the day
+        rolls over.
+        """
+        if not self.calendar_enabled:
+            return
+        now = datetime.now()
+        if (self._meetings_at is not None
+                and self._meetings_at.date() == now.date()
+                and (now - self._meetings_at).total_seconds() < self.CALENDAR_REFRESH_S):
+            return
+        self._meetings_at = now
+        meetings = self.todays_meetings(now)
+        if meetings != self._meetings:
+            self._meetings = meetings
+            self.meetings_updated.emit(list(meetings))
 
     def _poll_once(self) -> None:
         try:
@@ -449,24 +552,29 @@ class OutlookMonitorController(QObject):
 
     email_matched = Signal(int, str, str, str)
     service_status = Signal(bool, str)
+    meetings_updated = Signal(list)
 
     _do_start = Signal()
     _do_stop = Signal()
 
     def __init__(self, db, interval_seconds: int = DEFAULT_INTERVAL_S,
                  scan_limit: int = DEFAULT_SCAN_LIMIT,
-                 parent: Optional[QObject] = None) -> None:
+                 parent: Optional[QObject] = None,
+                 calendar_enabled: bool = True) -> None:
         super().__init__(parent)
         self._available = False
         self._status_message = "확인 중"
+        self._meetings: list[dict] = []
 
         self.thread = QThread()
         self.thread.setObjectName("OutlookThread")
-        self.worker = OutlookMonitorWorker(db, interval_seconds, scan_limit)
+        self.worker = OutlookMonitorWorker(db, interval_seconds, scan_limit,
+                                           calendar_enabled=calendar_enabled)
         self.worker.moveToThread(self.thread)
 
         self.worker.email_matched.connect(self.email_matched)
         self.worker.service_status.connect(self._on_status)
+        self.worker.meetings_updated.connect(self._on_meetings)
         self._do_start.connect(self.worker.start_polling)
         self._do_stop.connect(self.worker.stop_polling)
 
@@ -497,6 +605,21 @@ class OutlookMonitorController(QObject):
     @property
     def available(self) -> bool:
         return self._available
+
+    @property
+    def meetings(self) -> list[dict]:
+        """Last known calendar entries for today (may be empty)."""
+        return list(self._meetings)
+
+    def set_calendar_enabled(self, enabled: bool) -> None:
+        self.worker.calendar_enabled = bool(enabled)
+        if not enabled and self._meetings:
+            self._meetings = []
+            self.meetings_updated.emit([])
+
+    def _on_meetings(self, meetings: list) -> None:
+        self._meetings = list(meetings)
+        self.meetings_updated.emit(self._meetings)
 
     @property
     def status_message(self) -> str:

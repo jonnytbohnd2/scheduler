@@ -53,6 +53,7 @@ from typing import Any, Iterable, Optional
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
+from holidays import calendar as holiday_calendar
 from db_manager import (
     REPEAT_DAILY,
     REPEAT_MONTHLY,
@@ -516,10 +517,27 @@ class HeuristicParser:
         ``is_day_offset`` is True for day/week/month offsets, where the caller
         should still look for an explicit clock time ("3일 뒤 오후 2시").
         """
+        low_text = text.lower()
+
+        # Business days first: "3영업일 뒤" must not be read as "3일 뒤".
+        # Deadlines in this office are quoted in working days, and a plain
+        # day-count lands on a Saturday roughly two times in seven.
+        m = re.search(r"(\d{1,3})\s*영업일\s*(뒤|후|이내|안|째|만에)?", low_text)
+        if m:
+            cal = holiday_calendar()
+            target = cal.add_business_days(now.date(), int(m.group(1)))
+            return (datetime.combine(target, now.time().replace(microsecond=0)),
+                    [m.span()], True)
+        m = re.search(r"(다음|담|익)\s*영업일", low_text)
+        if m:
+            target = holiday_calendar().next_business_day(now.date())
+            return (datetime.combine(target, now.time().replace(microsecond=0)),
+                    [m.span()], True)
+
         m = re.search(
             r"(\d{1,4})\s*(분|시간|일|주|개월|달|minutes?|mins?|hours?|hrs?|days?|weeks?|months?)"
             r"\s*(뒤|후|이따|이후|later|from\s+now)",
-            text.lower(),
+            low_text,
         )
         if not m:
             return None, [], False
@@ -827,6 +845,7 @@ TOOL_DELETE = "delete"
 TOOL_ADD_EMAIL = "add_email_reminder"
 TOOL_LIST_EMAIL = "list_email_reminders"
 TOOL_DELETE_EMAIL = "delete_email_reminder"
+TOOL_REPORT = "work_report"
 
 
 @dataclass(slots=True)
@@ -853,6 +872,21 @@ class ToolIntent:
         return {"tool": self.tool, "scope": self.scope, "query": self.query,
                 "keywords": self.keywords, "action": self.action}
 
+
+# "이번주 한 일", "주간보고", "지난주 뭐 했지" -- the Friday report. Needs a
+# completed-work sense, so a bare "이번주 일정" stays a plain listing.
+_REPORT_RE = re.compile(
+    r"(주간\s*보고|업무\s*보고|주보|월간\s*보고)"
+    r"|(?:이번\s*주|지난\s*주|저번\s*주|이번\s*달|금월|한\s*달)\s*"
+    r"(?:내가\s*)?(?:한\s*일|완료|끝낸|처리한|마친|한\s*것|한거)")
+
+# "주간보고" is also one of the most common *titles* in a Korean office, so
+# "매주 월요일 9시 주간보고" is a recurring appointment, not a request for the
+# report. A clock time or a recurrence word settles it, and so do the strong
+# creation verbs -- but not "만들어줘", which reads naturally for both.
+_REPORT_NOT_RE = re.compile(
+    r"매\s*(주|일|월|달)|격주|\d{1,2}\s*시|:\d{2}"
+    r"|추가|등록|잡아\s*줘|잡아줘|넣어\s*줘|넣어줘")
 
 # Separators between several items in one breath: "8/24 엑셀 제출 / 8/31 ppt
 # 제출". The slash must be surrounded by space -- an unspaced one belongs to a
@@ -1038,6 +1072,16 @@ def detect_tool_intent(
             intent.keywords = keywords
             intent.action = action
             return intent
+
+    # 0.5) Work report. "이번주 한 일" reads like a LIST query, so it has to be
+    #      settled before the list matchers get hold of it.
+    report = _REPORT_RE.search(low) and not _REPORT_NOT_RE.search(low)
+    if report:
+        intent.tool = TOOL_REPORT
+        intent.scope = ("last_week" if re.search(r"지난\s*주|저번\s*주", low)
+                        else "month" if re.search(r"이번\s*달|금월|한\s*달", low)
+                        else "week")
+        return intent
 
     # 1) CLEAR -- most specific
     if _CLEAR_RE.search(low) and re.search(r"완료|끝난|done|정리|비워", low):
@@ -2117,6 +2161,14 @@ def _selftest() -> None:  # pragma: no cover
         ("매월 12일에 할일에 특약OS이월 넣어줘", TOOL_ADD, "특약OS이월"),
         ("2026.7월 프론팅계약 bdx 8월18일 할일로 등록해줘", TOOL_ADD, "2026.7월 프론팅계약 bdx"),
         ("9월 9일까지 TCPL KYC 서류 확보", TOOL_ADD, "TCPL KYC 서류 확보"),
+        # Business days: deadlines here are quoted in working days.
+        ("3영업일 뒤 서류 제출 등록", TOOL_ADD, "서류 제출"),
+        ("다음 영업일 결재 확인 추가", TOOL_ADD, "결재 확인"),
+        # "주간보고" is a report command *and* a very common meeting title.
+        ("매주 월요일 9시 주간보고", TOOL_ADD, "주간보고"),
+        ("내일 10시 업무보고 등록", TOOL_ADD, "업무보고"),
+        ("이번주 한 일 알려줘", TOOL_REPORT, ""),
+        ("주간보고 뽑아줘", TOOL_REPORT, ""),
         ("김보성 db 카피 요청 3시간 후 알림 설정해줘", TOOL_ADD, "김보성 db 카피 요청"),
         ("내일 아레나 계산서 처리 마무리하기 오전 11시", TOOL_ADD, "아레나 계산서 처리 마무리하기"),
         # "8/24" -- office shorthand the parser used to ignore entirely, which

@@ -50,7 +50,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
@@ -430,6 +430,21 @@ CREATE TABLE IF NOT EXISTS awaited_emails (
 );
 CREATE INDEX IF NOT EXISTS idx_awaited_active
     ON awaited_emails (is_active, is_triggered);
+
+-- Work log. A recurring chore rolls to its next cycle when you tick it off,
+-- so the schedules table keeps no trace that this month's 특약OS이월 was
+-- actually done -- and that is precisely what a weekly report is made of.
+-- Rows are kept even if the schedule is later deleted: the work still happened.
+CREATE TABLE IF NOT EXISTS completions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    schedule_id  INTEGER,
+    title        TEXT    NOT NULL,
+    completed_at TEXT    NOT NULL,            -- when the box was ticked
+    due_at       TEXT,                        -- the slot it was due for
+    repeat_type  TEXT    NOT NULL DEFAULT 'none'
+);
+CREATE INDEX IF NOT EXISTS idx_completions_when
+    ON completions (completed_at);
 """
 
 def _columns_of(schema: str, table: str) -> list[tuple[str, str]]:
@@ -757,10 +772,12 @@ class DatabaseManager:
 
         if not done:
             self.update_schedule(schedule_id, is_done=0)
+            self._unlog_completion(schedule_id)
             return "reopened", schedule.target_time
 
         if not schedule.is_recurring:
             self.set_done(schedule_id, True)
+            self._log_completion(schedule, now)
             return "done", None
 
         # Anchor at the later of "now" and the current slot. Ticking a chore off
@@ -775,9 +792,98 @@ class DatabaseManager:
             return "done", None
 
         self.update_schedule(schedule_id, target_time=fmt_time(nxt), notified=0, is_done=0)
+        self._log_completion(schedule, now)
         log.info("Schedule #%d %r completed -> next cycle %s",
                  schedule_id, schedule.title, fmt_time(nxt))
         return "rolled", nxt
+
+    # ------------------------------------------------------------------ #
+    # work log
+    # ------------------------------------------------------------------ #
+    def _log_completion(self, schedule: Schedule, when: datetime) -> None:
+        """Record that a piece of work actually got done."""
+        try:
+            with self._lock:
+                self._sched().execute(
+                    "INSERT INTO completions "
+                    "(schedule_id, title, completed_at, due_at, repeat_type) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (int(schedule.id), schedule.title, fmt_time(when),
+                     fmt_time(schedule.target_time), schedule.repeat_type))
+        except sqlite3.Error:
+            # The tick itself already succeeded; losing a log row must not
+            # turn into a failed completion.
+            log.exception("Could not log completion of #%s", schedule.id)
+
+    def _unlog_completion(self, schedule_id: int) -> None:
+        """Un-ticking a box takes the newest log row back out."""
+        try:
+            with self._lock:
+                self._sched().execute(
+                    "DELETE FROM completions WHERE id = "
+                    "(SELECT id FROM completions WHERE schedule_id = ? "
+                    " ORDER BY completed_at DESC, id DESC LIMIT 1)",
+                    (int(schedule_id),))
+        except sqlite3.Error:
+            log.exception("Could not un-log completion of #%s", schedule_id)
+
+    def completions_between(self, start: datetime,
+                            end: datetime) -> list[dict[str, Any]]:
+        """Everything ticked off in a window, oldest first."""
+        with self._lock:
+            rows = self._sched().execute(
+                "SELECT title, completed_at, due_at, repeat_type FROM completions "
+                "WHERE completed_at >= ? AND completed_at < ? "
+                "ORDER BY completed_at ASC, id ASC",
+                (fmt_time(start), fmt_time(end))).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "title": r["title"],
+                "completed_at": parse_time(r["completed_at"]),
+                "due_at": parse_time(r["due_at"]) if r["due_at"] else None,
+                "repeat_type": r["repeat_type"] or REPEAT_NONE,
+            })
+        return out
+
+    def work_report(self, start: datetime, end: datetime,
+                    include_open: bool = True) -> str:
+        """The 주간보고 paragraph, ready to paste.
+
+        Built purely from the database -- no model involved, so nothing in it
+        can be invented. Anything not actually ticked off simply is not here.
+        """
+        done = self.completions_between(start, end)
+        lines = [f"[{start.strftime('%m/%d')} ~ "
+                 f"{(end - timedelta(days=1)).strftime('%m/%d')}] 완료한 업무"]
+        if done:
+            seen: set[str] = set()
+            for row in done:
+                when = row["completed_at"]
+                stamp = f"{when.strftime('%m/%d')}({WEEKDAY_NAMES_KO[when.weekday()]})"
+                mark = " ↻" if row["repeat_type"] != REPEAT_NONE else ""
+                key = f"{row['title']}|{stamp}"
+                if key in seen:                 # same chore twice in a day
+                    continue
+                seen.add(key)
+                lines.append(f"- {row['title']}{mark}  ({stamp})")
+        else:
+            lines.append("- (완료 처리한 항목이 없습니다)")
+
+        if include_open:
+            now = datetime.now()
+            pending = [s for s in self.list_schedules(include_done=False)
+                       if s.target_time < end + timedelta(days=7)]
+            pending.sort(key=lambda s: s.target_time)
+            if pending:
+                lines.append("")
+                lines.append("[예정 · 진행 중]")
+                for s in pending[:12]:
+                    stamp = (f"{s.target_time.strftime('%m/%d')}"
+                             f"({WEEKDAY_NAMES_KO[s.target_time.weekday()]})")
+                    late = " ⚠지남" if s.target_time < now else ""
+                    lines.append(f"- {s.title}  ({stamp}){late}")
+        return "\n".join(lines)
 
     def delete_schedule(self, schedule_id: int) -> None:
         with self._lock:
@@ -1299,6 +1405,36 @@ def _selftest() -> None:  # pragma: no cover - manual smoke test
     assert len(remaining) == 3, remaining
     # a bad path is reported, not raised
     assert db.backup_to("\0invalid") is None
+
+    # --- work log / weekly report ------------------------------------------- #
+    mon = datetime(2026, 8, 17, 9, 0)          # a Monday
+    one_off = db.add_schedule("경영전략 엑셀 제출", datetime(2026, 8, 20, 9, 0))
+    chore = db.add_schedule("월간 요율표 갱신", datetime(2026, 8, 19, 9, 0), "monthly")
+    db.complete_schedule(one_off, now=datetime(2026, 8, 20, 14, 30))
+    db.complete_schedule(chore, now=datetime(2026, 8, 19, 11, 0))
+
+    logged = db.completions_between(mon, mon + timedelta(days=5))
+    titles = [r["title"] for r in logged]
+    assert titles == ["월간 요율표 갱신", "경영전략 엑셀 제출"], titles
+    # The recurring row has already rolled forward, yet the work is on record.
+    assert db.get_schedule(chore).target_time > datetime(2026, 8, 19, 9, 0)
+    assert not db.get_schedule(chore).is_done, "recurring chore should stay live"
+
+    report = db.work_report(mon, mon + timedelta(days=5))
+    assert "월간 요율표 갱신 ↻" in report, report
+    assert "경영전략 엑셀 제출" in report, report
+    assert "08/20(목)" in report, report
+    # Nothing outside the window leaks in. (Earlier cases in this self-test
+    # completed their own items, so check by title rather than emptiness.)
+    earlier = [r["title"] for r in db.completions_between(mon - timedelta(days=7), mon)]
+    assert "월간 요율표 갱신" not in earlier and "경영전략 엑셀 제출" not in earlier, earlier
+
+    # Un-ticking takes the entry back out again.
+    db.complete_schedule(one_off, done=False, now=datetime(2026, 8, 21, 9, 0))
+    assert [r["title"] for r in
+            db.completions_between(mon, mon + timedelta(days=5))] == ["월간 요율표 갱신"]
+    db.delete_schedule(one_off)
+    db.delete_schedule(chore)
 
     # --- opening a database from an older build ----------------------------- #
     # A missing column is a crash on open, which to the user looks like their

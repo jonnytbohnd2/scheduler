@@ -32,6 +32,82 @@ from db_manager import DatabaseManager, Schedule, fmt_time
 log = logging.getLogger(__name__)
 
 
+class QuietHours:
+    """When the user is not at their desk, so an alarm would just be noise.
+
+    Holding rather than dropping: the schedule row is left completely alone,
+    so an alarm that came due at 22:40 simply fires at 09:00 -- and still
+    fires if the PC was switched off in between.
+    """
+
+    def __init__(self, start: str = "09:00", end: str = "18:00",
+                 lunch_start: str = "12:00", lunch_end: str = "13:00",
+                 skip_lunch: bool = False, skip_holidays: bool = True,
+                 enabled: bool = False,
+                 calendar: Optional[object] = None) -> None:
+        self.enabled = bool(enabled)
+        self.start = _parse_hhmm(start, 9, 0)
+        self.end = _parse_hhmm(end, 18, 0)
+        self.lunch_start = _parse_hhmm(lunch_start, 12, 0)
+        self.lunch_end = _parse_hhmm(lunch_end, 13, 0)
+        self.skip_lunch = bool(skip_lunch)
+        self.skip_holidays = bool(skip_holidays)
+        self._calendar = calendar
+
+    # -- helpers --------------------------------------------------------- #
+    def _is_workday(self, moment: datetime) -> bool:
+        if not self.skip_holidays:
+            return True
+        cal = self._calendar
+        if cal is None:
+            from holidays import calendar as _cal
+            cal = _cal()
+        return bool(cal.is_business_day(moment.date()))
+
+    def _within_workhours(self, moment: datetime) -> bool:
+        minutes = moment.hour * 60 + moment.minute
+        start, end = self.start, self.end
+        if start <= end:
+            inside = start <= minutes < end
+        else:                                   # a shift that crosses midnight
+            inside = minutes >= start or minutes < end
+        if inside and self.skip_lunch:
+            if self.lunch_start <= minutes < self.lunch_end:
+                return False
+        return inside
+
+    # -- API ------------------------------------------------------------- #
+    def is_quiet(self, moment: Optional[datetime] = None) -> bool:
+        if not self.enabled:
+            return False
+        moment = moment or datetime.now()
+        return not (self._is_workday(moment) and self._within_workhours(moment))
+
+    def next_active(self, moment: Optional[datetime] = None) -> datetime:
+        """First moment from now that is not quiet (probe by the quarter hour)."""
+        moment = (moment or datetime.now()).replace(second=0, microsecond=0)
+        if not self.is_quiet(moment):
+            return moment
+        probe = moment
+        for _ in range(4 * 24 * 40):            # up to ~40 days of holidays
+            probe += timedelta(minutes=15)
+            if not self.is_quiet(probe):
+                return probe.replace(minute=(probe.minute // 15) * 15)
+        return moment
+
+
+def _parse_hhmm(text: str, default_h: int, default_m: int) -> int:
+    """'09:30' -> minutes past midnight. Bad input falls back, never raises."""
+    try:
+        hours, _, mins = str(text).partition(":")
+        h, m = int(hours), int(mins or 0)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h * 60 + m
+    except (TypeError, ValueError):
+        pass
+    return default_h * 60 + default_m
+
+
 class SchedulerService(QObject):
     """Qt-friendly wrapper around an APScheduler polling job."""
 
@@ -63,9 +139,13 @@ class SchedulerService(QObject):
         parent: Optional[QObject] = None,
         nag_minutes: int = 10,
         nag_max: int = 3,
+        quiet: Optional["QuietHours"] = None,
     ) -> None:
         super().__init__(parent)
         self.db = db
+        #: When set, alarms are held outside working hours.
+        self.quiet = quiet
+        self._quiet_since: Optional[datetime] = None
         self.interval_seconds = max(1, int(interval_seconds))
         #: Gap between re-reminders, and how many times to try.
         self.nag_minutes = max(1, int(nag_minutes))
@@ -162,6 +242,22 @@ class SchedulerService(QObject):
             return                                    # previous poll still busy
         try:
             now = datetime.now().replace(microsecond=0)
+            if self.quiet is not None and self.quiet.is_quiet(now):
+                # Outside working hours the alarm is noise, not a reminder:
+                # nobody is going to act on 특약OS이월 at 22:40. Hold everything
+                # and let the next poll after work resumes deliver it -- the
+                # rows are untouched, so nothing is lost if the PC is off.
+                if self._quiet_since is None:
+                    self._quiet_since = now
+                    log.info("Quiet hours: holding alarms until %s",
+                             self.quiet.next_active(now).strftime("%m-%d %H:%M"))
+                self.tick.emit()
+                return
+            if self._quiet_since is not None:
+                log.info("Quiet hours over (held since %s)",
+                         self._quiet_since.strftime("%m-%d %H:%M"))
+                self._quiet_since = None
+
             due = self.db.due_schedules(now)
             if due:
                 self._fire(due, now)
@@ -309,6 +405,56 @@ def _selftest() -> None:  # pragma: no cover - manual smoke test
 
     assert humanize_countdown(4530).startswith("1시간 15분")
     assert humanize_countdown(-90).endswith("지남")
+
+    # --- quiet hours -------------------------------------------------------- #
+    from holidays import HolidayCalendar
+    cal = HolidayCalendar()
+    q = QuietHours(enabled=True, calendar=cal)                # 09:00-18:00
+    THU = datetime(2026, 8, 20, 10, 0)          # ordinary working Thursday
+    assert not q.is_quiet(THU), "근무 시간인데 조용히 함"
+    assert q.is_quiet(THU.replace(hour=7)), "출근 전인데 알림"
+    assert q.is_quiet(THU.replace(hour=22)), "퇴근 후인데 알림"
+    assert q.is_quiet(datetime(2026, 8, 22, 10, 0)), "토요일인데 알림"
+    assert q.is_quiet(datetime(2026, 8, 15, 10, 0)), "광복절인데 알림"
+    # 22:40 Thursday -> next active is Friday 09:00
+    nxt = q.next_active(THU.replace(hour=22, minute=40))
+    assert (nxt.day, nxt.hour) == (21, 9), nxt
+    # Friday evening -> skips the weekend to Monday
+    nxt = q.next_active(datetime(2026, 8, 21, 19, 0))
+    assert (nxt.day, nxt.hour) == (24, 9), nxt
+    # lunch is only excluded when asked for
+    assert not q.is_quiet(THU.replace(hour=12, minute=30))
+    q.skip_lunch = True
+    assert q.is_quiet(THU.replace(hour=12, minute=30)), "점심 제외인데 알림"
+    q.skip_lunch = False
+    # disabled means never quiet, whatever the clock says
+    q.enabled = False
+    assert not q.is_quiet(THU.replace(hour=3)), "꺼져 있는데 조용히 함"
+    # a night shift that wraps midnight
+    night = QuietHours(start="22:00", end="06:00", enabled=True,
+                       skip_holidays=False, calendar=cal)
+    assert not night.is_quiet(datetime(2026, 8, 20, 23, 0))
+    assert not night.is_quiet(datetime(2026, 8, 20, 2, 0))
+    assert night.is_quiet(datetime(2026, 8, 20, 12, 0))
+    # garbage settings fall back instead of raising
+    broken = QuietHours(start="사팔", end="", enabled=True, calendar=cal)
+    assert broken.start == 9 * 60 and broken.end == 18 * 60
+
+    # the poller holds everything while quiet, then delivers
+    db2 = DatabaseManager(tempfile.mkdtemp(prefix="hud_quiet_"))
+    quiet_now = QuietHours(enabled=True, calendar=cal)
+    svc2 = SchedulerService(db2, interval_seconds=1, quiet=quiet_now)
+    seen: list[str] = []
+    svc2.schedule_due.connect(lambda s: seen.append(s.title))
+    db2.add_schedule("야간 알람", datetime.now() - timedelta(minutes=1))
+    quiet_now.start, quiet_now.end = 0, 1        # "work" is 00:00-00:01 -> quiet
+    svc2._poll()
+    assert seen == [], f"조용한 시간에 울림: {seen}"
+    quiet_now.enabled = False
+    svc2._poll()
+    assert seen == ["야간 알람"], f"조용한 시간이 끝났는데 안 울림: {seen}"
+    db2.close()
+
     print("scheduler_service self-test OK ->", heard)
 
 

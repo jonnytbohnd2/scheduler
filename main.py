@@ -79,6 +79,7 @@ from llm_engine import (
     TOOL_DELETE_EMAIL,
     TOOL_LIST,
     TOOL_LIST_EMAIL,
+    TOOL_REPORT,
     LlmController,
     ParseResult,
     ToolIntent,
@@ -89,8 +90,10 @@ from llm_engine import (
     detect_tool_intent,
     find_model_path,
 )
+from holidays import HOLIDAYS_FILENAME, calendar as holiday_calendar
 from outlook_service import OutlookMonitorController
-from scheduler_service import SchedulerService, humanize_countdown
+from scheduler_service import (QuietHours, SchedulerService,
+                               _parse_hhmm as _hhmm, humanize_countdown)
 from ui_components import (
     FILTER_ALL,
     ChatInput,
@@ -107,6 +110,7 @@ from ui_components import (
     SettingsDialog,
     TitleBar,
     Toast,
+    WorkReportDialog,
     build_stylesheet,
     filter_schedules,
     make_app_icon,
@@ -151,12 +155,16 @@ class HudWindow(QWidget):
 
         self.sound = NotificationSound(volume=config.behavior["sound_volume"])
         self.llm = LlmController(dict(config.llm))
+        self.quiet = QuietHours()
+        self._sync_quiet_hours()
         self.scheduler = SchedulerService(
             db, interval_seconds=config.behavior["poll_seconds"],
             nag_minutes=int(config.behavior.get("nag_minutes", 10)),
-            nag_max=int(config.behavior.get("nag_max_count", 3)))
+            nag_max=int(config.behavior.get("nag_max_count", 3)),
+            quiet=self.quiet)
         self.outlook = OutlookMonitorController(
-            db, interval_seconds=int(config.behavior.get("outlook_poll_seconds", 10)))
+            db, interval_seconds=int(config.behavior.get("outlook_poll_seconds", 10)),
+            calendar_enabled=bool(config.behavior.get("calendar_enabled", True)))
 
         self._build_window()
         self._build_ui()
@@ -272,6 +280,14 @@ class HudWindow(QWidget):
         strip.addWidget(self.next_label, 1)
         self.schedule_layout.addWidget(self.summary_row)
 
+        # Outlook's calendar, read-only. Meetings live in Outlook and always
+        # will; duplicating them into our DB would just create two sources of
+        # truth. One line saying what is on today is the useful part.
+        self.meeting_label = ElidedLabel("")
+        self.meeting_label.setObjectName("muted")
+        self.meeting_label.setVisible(False)
+        self.schedule_layout.addWidget(self.meeting_label)
+
         self.filter_bar = ScheduleFilterBar()
         self.filter_bar.set_current(
             str(self.config.window.get("schedule_filter", FILTER_ALL)), notify=False)
@@ -350,6 +366,7 @@ class HudWindow(QWidget):
 
         self.outlook.email_matched.connect(self.on_awaited_email_matched)
         self.outlook.service_status.connect(self.on_outlook_status)
+        self.outlook.meetings_updated.connect(self.on_meetings_updated)
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -450,6 +467,11 @@ class HudWindow(QWidget):
 
         self.sound.set_volume(float(cfg.behavior["sound_volume"]))
         self.scheduler.set_interval(int(cfg.behavior["poll_seconds"]))
+        self._sync_quiet_hours()
+        self.outlook.set_calendar_enabled(
+            bool(cfg.behavior.get("calendar_enabled", True)))
+        self.scheduler.nag_minutes = max(1, int(cfg.behavior.get("nag_minutes", 10)))
+        self.scheduler.nag_max = max(1, int(cfg.behavior.get("nag_max_count", 3)))
         self.llm.apply_options(dict(cfg.llm))
         self.refresh_schedules()
         cfg.save()
@@ -664,6 +686,7 @@ class HudWindow(QWidget):
         menu.addSeparator()
         menu.addAction("설정…", self.open_settings)
         menu.addAction("일정 직접 추가", lambda: self.open_manual_dialog())
+        menu.addAction("업무 보고 만들기…", self.open_work_report)
         menu.addAction("완료된 일정 정리", self.clear_completed)
         menu.addAction("대화 기록 지우기  (Ctrl+Shift+C)", self.clear_chat)
         menu.addSeparator()
@@ -861,6 +884,43 @@ class HudWindow(QWidget):
             title=schedule.title, when=schedule.target_time,
             repeat_type=schedule.repeat_type, repeat_detail=schedule.repeat_detail,
             schedule_id=schedule_id)
+
+    @guard("Outlook 일정 표시", toast=False)
+    def on_meetings_updated(self, meetings: list) -> None:
+        """One line under the summary: what Outlook says is on today."""
+        now = datetime.now()
+        upcoming = [m for m in meetings
+                    if (m.get("end") or m["start"]) >= now or m.get("all_day")]
+        if not upcoming:
+            self.meeting_label.setText("")
+            self.meeting_label.setVisible(False)
+            return
+        nxt = upcoming[0]
+        when = "종일" if nxt.get("all_day") else nxt["start"].strftime("%H:%M")
+        where = f" · {nxt['location']}" if nxt.get("location") else ""
+        more = f"  (+{len(upcoming) - 1})" if len(upcoming) > 1 else ""
+        self.meeting_label.setText(f"▤ {when}  {nxt['subject']}{where}{more}")
+        self.meeting_label.setToolTip("\n".join(
+            ("종일" if m.get("all_day") else m["start"].strftime("%H:%M"))
+            + f"  {m['subject']}" + (f" · {m['location']}" if m.get("location") else "")
+            for m in meetings))
+        self.meeting_label.setVisible(True)
+
+    def _sync_quiet_hours(self) -> None:
+        """Push the working-hours settings into the live QuietHours object."""
+        b = self.config.behavior
+        self.quiet.enabled = bool(b.get("quiet_enabled", False))
+        self.quiet.start = _hhmm(b.get("work_start", "09:00"), 9, 0)
+        self.quiet.end = _hhmm(b.get("work_end", "18:00"), 18, 0)
+        self.quiet.lunch_start = _hhmm(b.get("lunch_start", "12:00"), 12, 0)
+        self.quiet.lunch_end = _hhmm(b.get("lunch_end", "13:00"), 13, 0)
+        self.quiet.skip_lunch = bool(b.get("quiet_skip_lunch", False))
+        self.quiet.skip_holidays = bool(b.get("quiet_skip_holidays", True))
+
+    @guard("업무 보고 만들기")
+    def open_work_report(self) -> None:
+        """The Friday paragraph, assembled from what was actually completed."""
+        WorkReportDialog(self.db, self).exec()
 
     @guard("완료 일정 정리")
     def clear_completed(self) -> None:
@@ -1089,6 +1149,7 @@ class HudWindow(QWidget):
             TOOL_ADD_EMAIL: self._tool_add_email,
             TOOL_LIST_EMAIL: self._tool_list_email,
             TOOL_DELETE_EMAIL: self._tool_delete_email,
+            TOOL_REPORT: self._tool_report,
         }
         handler = handlers.get(intent.tool)
         if handler is None:
@@ -1121,6 +1182,20 @@ class HudWindow(QWidget):
         self.toast.show_text(f"일정 {len(items)}건 등록됨", "success")
         body = "\n".join(f"{i}. {line}" for i, line in enumerate(lines, 1))
         return f"✅ 일정 {len(items)}건 등록 완료:\n{body}"
+
+    def _tool_report(self, intent: ToolIntent) -> str:
+        """"이번주 한 일" in the chat tab -- same text the dialog produces."""
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if intent.scope == "month":
+            start = today.replace(day=1)
+            end = (start + timedelta(days=32)).replace(day=1)
+        else:
+            monday = today - timedelta(days=today.weekday())
+            if intent.scope == "last_week":
+                monday -= timedelta(weeks=1)
+            start, end = monday, monday + timedelta(days=7)
+        body = self.db.work_report(start, end, include_open=False)
+        return f"{body}\n\n(우클릭 → 업무 보고 만들기 에서 복사할 수 있습니다)"
 
     def _tool_list(self, intent: ToolIntent) -> str:
         now = datetime.now()
@@ -1470,6 +1545,15 @@ def main() -> int:
     data = resolve_data_dir(base, argv)
     migrated = migrate_legacy_data(base, data)
     set_data_dir(data)          # models/ is looked up here first, then beside the exe
+
+    # Business-day arithmetic. The shipped table only reaches so far and knows
+    # nothing about company shutdown days, so holidays.txt in the data folder
+    # overrides it -- write the commented template on first run.
+    try:
+        holiday_cal = holiday_calendar(data)
+        holiday_cal.write_template(os.path.join(data, HOLIDAYS_FILENAME))
+    except Exception:                                    # noqa: BLE001
+        log.exception("Holiday calendar unavailable; business days may be off")
 
     crash_handler.setup_logging(data, verbose="--debug" in argv)
     crash_handler.install(data, APP_NAME)

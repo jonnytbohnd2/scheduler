@@ -28,6 +28,7 @@ from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
 from PySide6.QtCore import (
+    QTime,
     Property,
     QEasingCurve,
     QEvent,
@@ -70,6 +71,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QTimeEdit,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -565,6 +567,15 @@ class SoftCard(QFrame):
         painter.setPen(QPen(faded(self._border or s.line, self.FADE_BORDER_FLOOR), 1.0))
         painter.setBrush(faded(self._fill or s.soft, self.FADE_FILL_FLOOR))
         painter.drawRoundedRect(rect, radius, radius)
+
+
+def _holiday_note() -> str:
+    """Coverage of the bundled holiday table, for the settings hint."""
+    try:
+        from holidays import calendar as _cal
+        return _cal().coverage_note()
+    except Exception:                                # noqa: BLE001
+        return ""
 
 
 class IconButton(QPushButton):
@@ -2197,6 +2208,96 @@ class WeekdayPicker(QWidget):
             btn.blockSignals(False)
 
 
+class WorkReportDialog(GlassDialog):
+    """"이번 주 한 일" -- the paragraph everyone has to write on Friday.
+
+    Assembled from the completion log, so every line is something that was
+    actually ticked off. The text is editable before copying: the point is to
+    save the recalling, not to dictate the wording.
+    """
+
+    PERIODS = (("이번 주", 0), ("지난 주", -1), ("이번 달", "month"))
+
+    def __init__(self, db, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent, "업무 보고 · 완료 내역", width=372)
+        self.db = db
+        s = style()
+
+        row = QHBoxLayout()
+        row.setSpacing(s.gap)
+        self._buttons: list[QPushButton] = []
+        for label, key in self.PERIODS:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.clicked.connect(lambda _=False, k=key: self._select(k))
+            self._buttons.append(btn)
+            row.addWidget(btn)
+        row.addStretch(1)
+        self.include_open = QCheckBox("예정 항목도 포함")
+        self.include_open.setChecked(True)
+        self.include_open.toggled.connect(lambda _: self._rebuild())
+        row.addWidget(self.include_open)
+        self.body.addLayout(row)
+
+        self.text = QPlainTextEdit()
+        self.text.setMinimumHeight(224)
+        self.text.setStyleSheet(
+            f"font-size: {s.f_sm}px; line-height: 150%;")
+        self.body.addWidget(self.text)
+
+        hint = QLabel("복사한 뒤 보고서에 그대로 붙여넣으세요. 수정해도 됩니다.")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        self.body.addWidget(hint)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        self.copy_btn = QPushButton("복사")
+        self.copy_btn.setObjectName("primary")
+        self.copy_btn.clicked.connect(self._copy)
+        close = QPushButton("닫기")
+        close.clicked.connect(self.reject)
+        actions.addWidget(close)
+        actions.addWidget(self.copy_btn)
+        self.body.addLayout(actions)
+
+        self._period = 0
+        self._select(0)
+
+    # -- period maths ---------------------------------------------------- #
+    def _range(self) -> tuple[datetime, datetime]:
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if self._period == "month":
+            start = today.replace(day=1)
+            nxt = (start + timedelta(days=32)).replace(day=1)
+            return start, nxt
+        monday = today - timedelta(days=today.weekday())
+        monday += timedelta(weeks=int(self._period))
+        return monday, monday + timedelta(days=7)
+
+    def _select(self, key) -> None:
+        self._period = key
+        for btn, (_, k) in zip(self._buttons, self.PERIODS):
+            btn.setChecked(k == key)
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        start, end = self._range()
+        try:
+            text = self.db.work_report(start, end,
+                                       include_open=self.include_open.isChecked())
+        except Exception as exc:                      # noqa: BLE001
+            text = f"보고서를 만들지 못했습니다: {exc}"
+        self.text.setPlainText(text)
+
+    def _copy(self) -> None:
+        QApplication.clipboard().setText(self.text.toPlainText())
+        self.copy_btn.setText("복사됨 ✔")
+        QTimer.singleShot(1400, lambda: self.copy_btn.setText("복사"))
+
+
 class ManualScheduleDialog(GlassDialog):
     """Manual date/time picker -- the fallback and the edit dialog."""
 
@@ -2571,6 +2672,27 @@ class SettingsDialog(GlassDialog):
         spin.valueChanged.connect(lambda v: None if self._loading else on_change(v))
         return spin
 
+    def _time_range(self, start: str, end: str, on_start, on_end) -> QWidget:
+        """Two HH:MM pickers with a dash, for "09:00 ~ 18:00"."""
+        box = QWidget()
+        box.setAttribute(Qt.WA_TranslucentBackground, True)
+        row = QHBoxLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        for value, handler in ((start, on_start), (end, on_end)):
+            edit = QTimeEdit()
+            edit.setDisplayFormat("HH:mm")
+            edit.setTime(QTime.fromString(str(value), "HH:mm"))
+            edit.setFixedHeight(style().ctl_h)
+            edit.timeChanged.connect(
+                lambda t, h=handler: None if self._loading else h(t.toString("HH:mm")))
+            row.addWidget(edit)
+            if handler is on_start:
+                dash = QLabel("~")
+                dash.setObjectName("muted")
+                row.addWidget(dash)
+        return box
+
     def _apply(self, section: str, key: str, value) -> None:
         self.config.set(section, key, value)
         self.config._sanitise()
@@ -2700,6 +2822,35 @@ class SettingsDialog(GlassDialog):
         nag_hint.setObjectName("muted")
         nag_hint.setWordWrap(True)
         layout.addWidget(nag_hint)
+
+        layout.addWidget(self._section("근무 시간"))
+        layout.addWidget(self._check(
+            "근무 시간에만 알리기", b["quiet_enabled"],
+            lambda v: self._apply("behavior", "quiet_enabled", v)))
+        layout.addWidget(self._row("근무", self._time_range(
+            b["work_start"], b["work_end"],
+            lambda v: self._apply("behavior", "work_start", v),
+            lambda v: self._apply("behavior", "work_end", v))))
+        layout.addWidget(self._check(
+            "점심시간 제외", b["quiet_skip_lunch"],
+            lambda v: self._apply("behavior", "quiet_skip_lunch", v)))
+        layout.addWidget(self._row("점심", self._time_range(
+            b["lunch_start"], b["lunch_end"],
+            lambda v: self._apply("behavior", "lunch_start", v),
+            lambda v: self._apply("behavior", "lunch_end", v))))
+        layout.addWidget(self._check(
+            "주말·공휴일 제외", b["quiet_skip_holidays"],
+            lambda v: self._apply("behavior", "quiet_skip_holidays", v)))
+        layout.addWidget(self._check(
+            "Outlook 오늘 일정 표시", b["calendar_enabled"],
+            lambda v: self._apply("behavior", "calendar_enabled", v)))
+
+        quiet_hint = QLabel(
+            "근무 시간 밖의 알림은 사라지지 않고 다음 근무 시간에 울립니다.\n"
+            + _holiday_note())
+        quiet_hint.setObjectName("muted")
+        quiet_hint.setWordWrap(True)
+        layout.addWidget(quiet_hint)
 
         layout.addWidget(self._section("일정"))
         layout.addWidget(self._row("확인 주기", self._spin(
