@@ -310,6 +310,11 @@ _FILLER_SOFT = (
     # Bare "일정"/"스케줄" trail the item just as often -- "8/31 ppt 1차 제출
     # 일정 등록" names the list, not the task. Soft, so "내일 일정" survives.
     "일정", "스케줄", "건",
+    # Recurrence and part-of-day words the date/repeat matchers leave behind:
+    # "격주 수요일 3시 부서 미팅" kept 격주, "매주 마지막 금요일 …" kept 마지막,
+    # "매일 아침 오전 11시 …" kept 아침. None of them names the task.
+    "격주", "마지막", "첫째", "둘째", "셋째", "넷째",
+    "아침", "점심", "저녁", "새벽", "밤", "오전", "오후",
 )
 
 # --------------------------------------------------------------------------- #
@@ -368,13 +373,18 @@ _EN_MON_RE = (r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
               r"nov(?:ember)?|dec(?:ember)?")
 _ORD = r"(?:st|nd|rd|th)?"
 
-#: "August 27th", "Aug 27, 2026"
+#: "August 27th", "Aug 27, 2026". The day must not be a clock reading:
+#: in "27 August 16:45" this pattern happily took "August 16" as the date and
+#: swallowed the hour, leaving "27" stranded in the title.
 _EN_DATE_MD_RE = re.compile(
-    rf"\b(?P<mon>{_EN_MON_RE})\.?\s+(?P<day>\d{{1,2}}){_ORD}"
+    rf"\b(?P<mon>{_EN_MON_RE})\.?\s+(?P<day>\d{{1,2}}){_ORD}(?!\s*:)"
     rf"(?:\s*,?\s*(?P<year>20\d{{2}}))?\b", re.I)
-#: "27 August", "27th of Aug 2026"
+#: "27 August", "27th of Aug 2026". The day must not be the tail of a clock:
+#: "14:30 Nov 11" otherwise matched "30 Nov", and "09:00 Dec 1" matched
+#: "00 Dec" -- a day of zero, which then failed validation and took the real
+#: date down with it.
 _EN_DATE_DM_RE = re.compile(
-    rf"\b(?P<day>\d{{1,2}}){_ORD}\s+(?:of\s+)?(?P<mon>{_EN_MON_RE})\.?"
+    rf"\b(?<![:\d])(?P<day>\d{{1,2}}){_ORD}\s+(?:of\s+)?(?P<mon>{_EN_MON_RE})\.?"
     rf"(?:\s*,?\s*(?P<year>20\d{{2}}))?\b", re.I)
 
 
@@ -434,11 +444,12 @@ class HeuristicParser:
             # "3일 뒤 오후 2시" -> take the day from the offset and the clock
             # time from the explicit expression, not from `now`.
             if rel_is_day:
-                clock, _conf, spans_t, _mer, explicit = self._match_time(raw)
+                clock, _conf, spans_t, meridiem, explicit = self._match_time(raw)
                 if clock:
                     spans += spans_t
                     result.explicit_time = explicit
-                    rel_dt = rel_dt.replace(hour=clock[0], minute=clock[1])
+                    hour = self._afternoon(clock[0], meridiem)
+                    rel_dt = rel_dt.replace(hour=hour, minute=clock[1])
                 else:
                     rel_dt = rel_dt.replace(hour=self.DEFAULT_HOUR, minute=0)
             result.target_time = rel_dt.replace(second=0, microsecond=0)
@@ -457,11 +468,8 @@ class HeuristicParser:
 
             base = date_part or now.date()
             hour, minute = time_part if time_part else (self.DEFAULT_HOUR, 0)
-            # Korean scheduling convention: an unqualified 1~6시 means the
-            # afternoon. "2시 반 치과" is 14:30, never 02:30. 7~12시 are left
-            # alone because "7시 회의"/"10시 회의" really are morning meetings.
-            if time_part and not meridiem and 1 <= hour <= 6:
-                hour += 12
+            if time_part:
+                hour = self._afternoon(hour, meridiem)
             candidate = datetime(base.year, base.month, base.day, hour, minute)
             if date_part is None and candidate <= now:
                 candidate += timedelta(days=1)
@@ -551,6 +559,19 @@ class HeuristicParser:
         return REPEAT_NONE, "", spans
 
     # ---- relative offsets ------------------------------------------------ #
+
+    @staticmethod
+    def _afternoon(hour: int, meridiem: bool) -> int:
+        """Korean scheduling convention: an unqualified 1~6시 is the afternoon.
+
+        "2시 반 치과" is 14:30, never 02:30. 7~12시 are left alone because
+        "7시 회의" / "10시 회의" really are morning meetings.
+
+        This lives in one place because it did not used to: the day-offset
+        branch of :meth:`parse` had its own copy that forgot the rule, so
+        "오늘 5시" was 17:00 while "5일 후 5시" was 05:00.
+        """
+        return hour + 12 if (not meridiem and 1 <= hour <= 6) else hour
 
     def _match_relative(self, text: str, now: datetime):
         """-> (datetime | None, spans, is_day_offset)
@@ -673,23 +694,30 @@ class HeuristicParser:
         # English month names, both orders: "August 27th", "27 Aug",
         # "Aug 27, 2026". Reinsurance correspondence is bilingual, so a line
         # pasted out of a London broker's mail has to work.
-        m = _EN_DATE_MD_RE.search(low) or _EN_DATE_DM_RE.search(low)
-        if m:
+        # Day-first is tried first: "27 August" is unambiguous, while the
+        # month-first pattern would otherwise match its tail as "August ...".
+        # Both are tried, because a match that fails validation must not stop
+        # the other pattern from finding the real date.
+        for pattern in (_EN_DATE_DM_RE, _EN_DATE_MD_RE):
+            m = pattern.search(low)
+            if not m:
+                continue
             groups = m.groupdict()
             month = _EN_MONTHS.get((groups.get("mon") or "")[:3])
             try:
                 day = int(groups.get("day") or 0)
             except (TypeError, ValueError):
                 day = 0
-            if month and 1 <= day <= 31:
-                year = int(groups["year"]) if groups.get("year") else now.year
-                try:
-                    candidate = date(year, month, day)
-                    if not groups.get("year") and candidate < today:
-                        candidate = date(year + 1, month, day)
-                    return candidate, 0.9, [m.span()], True
-                except ValueError:
-                    pass
+            if not (month and 1 <= day <= 31):
+                continue
+            year = int(groups["year"]) if groups.get("year") else now.year
+            try:
+                candidate = date(year, month, day)
+            except ValueError:
+                continue
+            if not groups.get("year") and candidate < today:
+                candidate = date(year + 1, month, day)
+            return candidate, 0.9, [m.span()], True
 
         # --- month-relative words -----------------------------------------
         month_shift, shift_span = self._match_month_word(low)
@@ -834,11 +862,14 @@ class HeuristicParser:
                 return 0 if hour == 12 else hour
             return hour
 
-        # HH:MM, optionally with a meridiem word
-        m = re.search(r"(오전|오후|아침|저녁|밤|새벽|am|pm)?\s*(\d{1,2})\s*:\s*(\d{2})", low)
+        # HH:MM, with a meridiem on either side. English puts it after
+        # ("10:30am"); leaving it out of the match both dropped the pm shift
+        # and left a stray "am" sitting in the title.
+        m = re.search(r"(오전|오후|아침|저녁|밤|새벽|am|pm)?\s*(\d{1,2})\s*:\s*(\d{2})"
+                      r"\s*(am|pm|a\.m\.|p\.m\.)?", low)
         if m:
             hour, minute = int(m.group(2)), int(m.group(3))
-            hour = shift(m.group(1), hour)
+            hour = shift(m.group(1) or m.group(4), hour)
             if 0 <= hour <= 23 and 0 <= minute <= 59:
                 return (hour, minute), 0.95, [m.span()], True, True
 
@@ -909,8 +940,11 @@ class HeuristicParser:
             # Cutting an English date out of a sentence leaves its preposition
             # behind: "1pm on August 27th JB BODA 미팅" -> "on JB BODA 미팅".
             # Only trim at the edges -- "hands on training" must survive.
+            # A space is required after the word, not just a boundary: with
+            # \b alone the "a" in "A-1 등급 심사" counted as the article and
+            # the title became "1 등급 심사".
             text = re.sub(r"^(?:(?:on|at|by|from|in|of|the|a|next|this|coming|"
-                          r"last)\b\s*)+", "", text, flags=re.I)
+                          r"last)\s+)+", "", text, flags=re.I)
             text = re.sub(r"(?:\s*\b(?:on|at|by|from|in|of|the|a)\b)+$", "",
                           text, flags=re.I)
             return text.strip(" ,.!?~-·|")
@@ -986,7 +1020,12 @@ _REPORT_NOT_RE = re.compile(
 # Separators between several items in one breath: "8/24 엑셀 제출 / 8/31 ppt
 # 제출". The slash must be surrounded by space -- an unspaced one belongs to a
 # date ("8/24"), which is exactly how this went wrong in production.
-_ITEM_SPLIT_RE = re.compile(r"\s+/\s+|\s*[;\n]\s*|\s*,\s*|\s+그리고\s+|\s+및\s+")
+#
+# The comma must not be the one inside "Dec 1, 2026": splitting there gave
+# "…보고 Dec 1" and "2026 새벽 6시", both of which look dated enough to pass,
+# so a single English date silently became two schedules.
+_ITEM_SPLIT_RE = re.compile(
+    r"\s+/\s+|\s*[;\n]\s*|\s*,(?!\s*20\d{2}\b)\s*|\s+그리고\s+|\s+및\s+")
 
 # "…2개 별도로", "…각각 등록" -- says how to file the items, not what they are.
 _COUNT_TAIL_RE = re.compile(
@@ -1015,6 +1054,11 @@ def _parse_items(text: str, parser: "HeuristicParser",
         parsed = parser.parse(segment, now)
         if not parsed.definite:
             return []                    # one vague piece -> treat as one item
+        # A piece whose whole title is a number is not a task -- it is the
+        # other half of something we should not have cut, like the year in
+        # "Dec 1, 2026".
+        if parsed.title.isdigit():
+            return []
         results.append(parsed)
     # Distinct times, or the user wrote one thing that merely looks like two.
     if len({r.target_time for r in results}) < len(results):

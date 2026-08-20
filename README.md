@@ -291,15 +291,26 @@ are no binary art assets to ship.
 ## Self-tests
 
 ```
-py test_corpus.py     # 111 phrases a Korean reinsurance office would type
+py test_corpus.py     # 1046 phrases a Korean reinsurance office would type
+py test_corpus.py -v  # ...printed one per line
 ```
 
-`test_corpus.py` exists because the author's own test cases kept missing what
-the user actually typed -- `8/24`, `1pm on August 27th`, `1/2 시무식`. Each
-entry pins the tool, the exact title and the exact resulting datetime, with
-`NOW` fixed to a **Friday** (business-day and "next week" logic behaves
-differently at the end of a week). Roughly a third of the cases assert that
-something is *not* a schedule.
+`test_corpus.py` exists because hand-written cases kept testing the author's
+assumptions back at him, while every bug that reached the user came from a
+sentence nobody had imagined: `8/24`, `1pm on August 27th`, `1/2 시무식`,
+`다음주 월요일`.
+
+Most of it is therefore **generated** — date expressions × clock expressions ×
+real task titles, recombined by templates — and the ground truth is computed
+independently, with plain calendar arithmetic inside the test file. Nothing
+asks `llm_engine` what the right answer is, so a parser bug cannot make the
+test agree with it. `NOW` is pinned to a **Friday**: business-day maths and
+`다음주` behave differently at the end of a week, and the Monday version of
+this corpus missed a bug that shipped.
+
+Around 90 cases assert the opposite — that a phrase is *not* a schedule.
+Over-firing is worse than under-firing here: a missed booking is visible, a
+junk one titled `일정` is not.
 
 
 Each module is runnable on its own and has no external test dependencies:
