@@ -47,7 +47,7 @@ import os
 import re
 import sys
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable, Optional
 
@@ -285,6 +285,9 @@ _FILLER_SOFT = (
     "리마인드", "리마인더", "알람", "알림", "reminder", "alarm",
     "할일에", "할 일에", "할일로", "할 일로", "할일", "할 일",
     "일정에", "일정으로", "스케줄에", "투두", "todo",
+    # Bare "일정"/"스케줄" trail the item just as often -- "8/31 ppt 1차 제출
+    # 일정 등록" names the list, not the task. Soft, so "내일 일정" survives.
+    "일정", "스케줄", "건",
 )
 
 # --------------------------------------------------------------------------- #
@@ -579,6 +582,29 @@ class HeuristicParser:
             except ValueError:
                 pass
 
+        # "8/24" -- office shorthand, and the form people actually type when
+        # copying a date out of a mail. Year-qualified variants ("2026/8/24")
+        # are already gone by now, so a bare pair is month/day. Requiring the
+        # neighbours to be non-numeric keeps us off "8/24/2026" tails and off
+        # ratios written without spaces.
+        # A trailing quantity word means it was a fraction, not a date:
+        # "3/4 정도만 끝냈어", "진행률이 2/3쯤 돼".
+        m = re.search(
+            r"(?<![\d/.\-])(\d{1,2})\s*/\s*(\d{1,2})"
+            r"(?![\d/.\-])(?!\s*(?:정도|쯤|가량|만큼|수준|밖에|이상|이하|짜리|배))",
+            low)
+        if m:
+            month, day = int(m.group(1)), int(m.group(2))
+            if 1 <= month <= 12 and 1 <= day <= 31:
+                try:
+                    year = now.year
+                    candidate = date(year, month, day)
+                    if candidate < today:               # "1/5" typed in December
+                        candidate = date(year + 1, month, day)
+                    return candidate, 0.88, [m.span()], True
+                except ValueError:
+                    pass
+
         # --- month-relative words -----------------------------------------
         month_shift, shift_span = self._match_month_word(low)
 
@@ -808,7 +834,11 @@ class ToolIntent:
     """A detected action the chat message is asking the app to perform."""
 
     tool: str = TOOL_NONE
-    schedule: Optional[ParseResult] = None      # for ADD
+    schedule: Optional[ParseResult] = None      # for ADD (first, if several)
+    #: ADD may cover several items -- "8/24 엑셀 제출 / 8/31 ppt 제출". Always
+    #: holds every item including the first; `schedule` stays for callers that
+    #: only ever expect one.
+    schedules: list[ParseResult] = field(default_factory=list)
     scope: str = "all"                          # for LIST: today | week | all | done
     query: str = ""                             # for DELETE: title fragment
     keywords: str = ""                          # for ADD_EMAIL: mail keywords
@@ -822,6 +852,45 @@ class ToolIntent:
         """Flat view of the intent (handy for logging and tests)."""
         return {"tool": self.tool, "scope": self.scope, "query": self.query,
                 "keywords": self.keywords, "action": self.action}
+
+
+# Separators between several items in one breath: "8/24 엑셀 제출 / 8/31 ppt
+# 제출". The slash must be surrounded by space -- an unspaced one belongs to a
+# date ("8/24"), which is exactly how this went wrong in production.
+_ITEM_SPLIT_RE = re.compile(r"\s+/\s+|\s*[;\n]\s*|\s*,\s*|\s+그리고\s+|\s+및\s+")
+
+# "…2개 별도로", "…각각 등록" -- says how to file the items, not what they are.
+_COUNT_TAIL_RE = re.compile(
+    r"(?:\d+\s*개\s*)?(?:별도로|별도|각각|따로따로|따로|개별로|개별)\s*$")
+
+
+def split_items(text: str) -> list[str]:
+    """Break one message into candidate schedule phrases.
+
+    Conservative on purpose: the caller only accepts the split when *every*
+    piece independently parses as a dated schedule, so an over-eager split of
+    "회의, 점심 약속" simply loses to the single-item path.
+    """
+    parts = [_COUNT_TAIL_RE.sub("", p).strip(" .·-") for p in _ITEM_SPLIT_RE.split(text)]
+    return [p for p in parts if len(p) >= 2]
+
+
+def _parse_items(text: str, parser: "HeuristicParser",
+                 now: Optional[datetime] = None) -> list["ParseResult"]:
+    """Several dated items in one message, or [] if it is not that shape."""
+    segments = split_items(text)
+    if len(segments) < 2:
+        return []
+    results = []
+    for segment in segments:
+        parsed = parser.parse(segment, now)
+        if not parsed.definite:
+            return []                    # one vague piece -> treat as one item
+        results.append(parsed)
+    # Distinct times, or the user wrote one thing that merely looks like two.
+    if len({r.target_time for r in results}) < len(results):
+        return []
+    return results
 
 
 # "추가/등록/잡아줘/알림 설정" -- an explicit request to create something.
@@ -979,10 +1048,18 @@ def detect_tool_intent(
     # 2) ADD with an explicit creation verb
     if _ADD_RE.search(low):
         # Strip the instruction verb so it never lands in the title.
-        result = parser.parse(_ADD_RE.sub(" ", raw), now)
+        stripped = _ADD_RE.sub(" ", raw)
+        several = _parse_items(stripped, parser, now)
+        if several:
+            intent.tool = TOOL_ADD
+            intent.schedules = several
+            intent.schedule = several[0]
+            return intent
+        result = parser.parse(stripped, now)
         if result.definite:
             intent.tool = TOOL_ADD
             intent.schedule = result
+            intent.schedules = [result]
             return intent
         # An add request we could not time -- fall through to LIST/chat rather
         # than guessing a time the user never gave.
@@ -1021,10 +1098,55 @@ def detect_tool_intent(
     #    verb, "내일 시간 괜찮을까?" goes to chat, not the database.
     if quick.definite and not _QUESTION_RE.search(raw):
         intent.tool = TOOL_ADD
-        intent.schedule = quick
+        several = _parse_items(raw, parser, now)
+        intent.schedules = several or [quick]
+        intent.schedule = intent.schedules[0]
         return intent
 
     return intent
+
+
+# --------------------------------------------------------------------------- #
+# Fabricated confirmations
+# --------------------------------------------------------------------------- #
+# Observed in production: the user typed "8/24 경영전략 엑셀 제출 / 8/31 ppt
+# 1차 제출 일정 등록 2개 별도로", the date format was not understood, no tool
+# ran -- and the 2B model answered "✅ 일정 등록 완료:" with two items and
+# invented times. Nothing was in the database. The user believed it was.
+#
+# A tool reply never reaches the model (handle_chat_submit returns first), so
+# by the time we are looking at generated text, *nothing was written*. Any
+# claim to the contrary is false and has to be replaced rather than shown.
+
+_CLAIM_RE = re.compile(
+    r"(등록|추가|저장|삭제|입력|반영)\s*(?:을|를|이|가)?\s*"
+    r"(?:모두\s*|전부\s*|정상적으로\s*)?"
+    r"(?:완료|되었|됐|하였|했|해\s*두었|해\s*놓았)")
+
+#: "등록하려면 …", "추가하시면 …" -- explaining how, not claiming to have done it.
+_INSTRUCTIONAL_RE = re.compile(r"(하려면|하시려면|하시면|하는\s*방법|할\s*수\s*있)")
+
+FALSE_CLAIM_NOTICE = (
+    "⚠ 방금 답변에 '등록했다'는 내용이 있었지만 **실제로 저장되지 않았습니다.**\n"
+    "AI가 지어낸 문구라 그대로 두면 안 되기에 지웠습니다.\n\n"
+    "날짜를 붙여 다시 말해주시면 바로 등록됩니다.\n"
+    "  · 8/24 경영전략 엑셀 제출 추가해줘\n"
+    "  · 8/24 엑셀 제출 / 8/31 ppt 제출 등록  (여러 건도 한 번에)\n\n"
+    "위쪽 입력창에 넣으셔도 됩니다."
+)
+
+
+def correct_false_action_claim(text: str) -> str:
+    """Replace a fabricated "saved it" reply with the truth.
+
+    Only ever called on model-generated text, i.e. on a turn where no tool
+    ran, so a completed-action claim is always wrong.
+    """
+    if not text or _INSTRUCTIONAL_RE.search(text):
+        return text
+    if not _CLAIM_RE.search(text):
+        return text
+    return FALSE_CLAIM_NOTICE
 
 
 # --------------------------------------------------------------------------- #
@@ -1997,6 +2119,13 @@ def _selftest() -> None:  # pragma: no cover
         ("9월 9일까지 TCPL KYC 서류 확보", TOOL_ADD, "TCPL KYC 서류 확보"),
         ("김보성 db 카피 요청 3시간 후 알림 설정해줘", TOOL_ADD, "김보성 db 카피 요청"),
         ("내일 아레나 계산서 처리 마무리하기 오전 11시", TOOL_ADD, "아레나 계산서 처리 마무리하기"),
+        # "8/24" -- office shorthand the parser used to ignore entirely, which
+        # sent the whole message to chat and got a fabricated confirmation.
+        ("8/24 경영전략 엑셀 제출 추가해줘", TOOL_ADD, "경영전략 엑셀 제출"),
+        ("9/3 부서 회식 등록", TOOL_ADD, "부서 회식"),
+        # …but a fraction is not a date.
+        ("3/4 정도만 끝냈어", TOOL_NONE, ""),
+        ("진행률이 2/3쯤 돼", TOOL_NONE, ""),
     ]
     for text, expect, extra in tool_cases:
         intent = detect_tool_intent(text, parser, now)
@@ -2017,6 +2146,48 @@ def _selftest() -> None:  # pragma: no cover
                   and intent.schedule.title == extra)
             detail = f"{intent.schedule.title!r} @ {intent.schedule.target_time}"
         print(f"{'OK  ' if ok else 'FAIL'} {text!r:34} -> {intent.tool:6} {detail!r}")
+
+    # --- several items in one message -------------------------------------- #
+    # The 2026-08-20 report: two schedules asked for, none saved, and the model
+    # answered "일정 등록 완료" with times it made up.
+    multi_cases = [
+        ("8/24 경영전략 엑셀 제출 / 8/31 ppt 1차 제출 일정 등록 2개 별도로",
+         [("경영전략 엑셀 제출", (8, 24)), ("ppt 1차 제출", (8, 31))]),
+        ("8/24 엑셀 제출, 8/31 ppt 제출 추가해줘",
+         [("엑셀 제출", (8, 24)), ("ppt 제출", (8, 31))]),
+        ("내일 회의 그리고 모레 보고서 추가해줘",
+         [("회의", (8, 11)), ("보고서", (8, 12))]),
+        # One vague piece means we cannot trust the split at all. The leftover
+        # text stays in the title on purpose: trimming it to a tidy "엑셀 제출"
+        # would quietly swallow the half of the request we could not schedule,
+        # and the user would never know the ppt part went nowhere.
+        ("8/24 엑셀 제출, 그리고 나중에 ppt도 추가해줘",
+         [("엑셀 제출, 그리고 나중에 ppt도", (8, 24))]),
+    ]
+    for text, expected in multi_cases:
+        intent = detect_tool_intent(text, parser, now)
+        got = [(s.title, (s.target_time.month, s.target_time.day))
+               for s in intent.schedules]
+        ok = intent.tool == TOOL_ADD and got == expected
+        failures += 0 if ok else 1
+        print(f"{'OK  ' if ok else 'FAIL'} {text[:38]!r:40} -> {got}")
+
+    # --- a fabricated confirmation must never reach the user ---------------- #
+    fabricated = ("✅ 일정 등록 완료:\n1. 8/24 경영전략 엑셀 제출 (09:00)\n"
+                  "2. 8/31 PPT 1 차 제출 (15:00)")
+    claim_cases = [
+        (fabricated, True), ("일정을 추가했습니다.", True),
+        ("삭제되었습니다.", True), ("모두 등록 완료했습니다", True),
+        ("일정을 등록하려면 날짜를 함께 알려주세요.", False),
+        ("위쪽 입력창에 넣으시면 등록할 수 있습니다.", False),
+        ("회의는 보통 오전에 하는 것이 좋습니다.", False),
+    ]
+    for text, should_replace in claim_cases:
+        replaced = correct_false_action_claim(text) == FALSE_CLAIM_NOTICE
+        ok = replaced == should_replace
+        failures += 0 if ok else 1
+        print(f"{'OK  ' if ok else 'FAIL'} claim {text[:30]!r:34} "
+              f"replaced={replaced}")
 
     print("\n--- awaited-email intents ---")
     email_cases = [

@@ -84,6 +84,7 @@ from llm_engine import (
     app_dir,
     backend_info,
     build_chat_context,
+    correct_false_action_claim,
     detect_tool_intent,
     find_model_path,
 )
@@ -1090,20 +1091,30 @@ class HudWindow(QWidget):
         return handler(intent)
 
     def _tool_add(self, intent: ToolIntent) -> Optional[str]:
-        result = intent.schedule
-        if result is None or not result.usable:
+        items = [r for r in (intent.schedules or [intent.schedule])
+                 if r is not None and r.usable]
+        if not items:
             return None
-        self.db.add_schedule(result.title, result.target_time,
-                             result.repeat_type, result.repeat_detail)
+
+        lines = []
+        for result in items:
+            self.db.add_schedule(result.title, result.target_time,
+                                 result.repeat_type, result.repeat_detail)
+            when = result.target_time.strftime("%m/%d %H:%M")
+            repeat = ""
+            if result.repeat_type != REPEAT_NONE:
+                sample = Schedule(0, result.title, result.target_time,
+                                  result.repeat_type, result.repeat_detail)
+                repeat = f" ({sample.repeat_label})"
+            lines.append(f"'{result.title}' — {when}{repeat}")
+
         self.refresh_schedules()
-        self.toast.show_text(f"‘{result.title}’ 등록됨", "success")
-        when = result.target_time.strftime("%m/%d %H:%M")
-        repeat = ""
-        if result.repeat_type != REPEAT_NONE:
-            sample = Schedule(0, result.title, result.target_time,
-                              result.repeat_type, result.repeat_detail)
-            repeat = f" ({sample.repeat_label})"
-        return f"✅ '{result.title}' 일정이 {when}{repeat} 으로 등록되었습니다."
+        if len(items) == 1:
+            self.toast.show_text(f"‘{items[0].title}’ 등록됨", "success")
+            return f"✅ {lines[0]} 으로 등록되었습니다."
+        self.toast.show_text(f"일정 {len(items)}건 등록됨", "success")
+        body = "\n".join(f"{i}. {line}" for i, line in enumerate(lines, 1))
+        return f"✅ 일정 {len(items)}건 등록 완료:\n{body}"
 
     def _tool_list(self, intent: ToolIntent) -> str:
         now = datetime.now()
@@ -1298,7 +1309,13 @@ class HudWindow(QWidget):
     def on_chat_finished(self, request_id: int, full_text: str) -> None:
         if request_id != self._chat_request_id:
             return
-        text = self.chat_view.end_stream(full_text)
+        # Getting here means no tool ran this turn, so the model cannot have
+        # saved anything -- if it says it did, show the truth instead.
+        corrected = correct_false_action_claim(full_text)
+        if corrected is not full_text:
+            log.warning("Model claimed a DB action that never happened: %r",
+                        full_text[:200])
+        text = self.chat_view.end_stream(corrected)
         self.chat_input.set_generating(False)
         self._chat_request_id = None
         if self._chat_db_row is not None:
