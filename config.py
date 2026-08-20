@@ -130,6 +130,11 @@ def migrate_legacy_data(app_dir: str, data_dir: str) -> list[str]:
         if not os.path.isdir(source) or os.path.isdir(target):
             continue
         try:
+            # models/ belongs in the data folder now, but a GGUF is over a
+            # gigabyte: copying it would double the disk use, and moving it
+            # would break a rollback to the previous build. So it is left
+            # alone and the app warns at startup that a model in the program
+            # folder will not survive the next upgrade.
             # models/ can hold multi-GB weights; copying would double the disk
             # use for no benefit, so it is left where it is and found by the
             # existing app-dir fallback in llm_engine.find_model_path().

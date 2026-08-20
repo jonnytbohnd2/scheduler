@@ -383,21 +383,33 @@ def _write_upgrade_script(out_dir: Path) -> None:
 
 def finalise(out_dir: Path, with_model: bool = False,
              model_file: Optional[Path] = None) -> None:
-    """Create the runtime layout the app expects next to the executable."""
+    """Create the runtime layout the app expects next to the executable.
+
+    The model belongs in the **data** folder, not here. A GGUF is over a
+    gigabyte, and the whole point of the split layout is that this folder can
+    be replaced wholesale to upgrade -- a model living in it would have to be
+    copied back every time. The app still reads this folder as a fallback, so
+    an older install keeps working; it just warns.
+    """
     models_out = out_dir / "models"
     models_out.mkdir(parents=True, exist_ok=True)
 
-    readme = models_out / "PUT_YOUR_GGUF_MODEL_HERE.txt"
+    readme = models_out / "MODEL_GOES_IN_THE_DATA_FOLDER.txt"
     readme.write_text(
-        "Offline Smart HUD - local model folder\n"
-        "======================================\n\n"
-        "Place your GGUF model in THIS folder, next to OfflineSmartHUD.exe:\n\n"
-        "    models/qwen2.5-1.5b-instruct-q4_k_m.gguf\n\n"
-        "Any other *.gguf file in this folder is picked up automatically if the\n"
-        "expected filename is absent. The model is intentionally NOT bundled\n"
-        "inside the executable, so you can swap it without rebuilding.\n\n"
-        "Without a model the app still runs: schedule entry uses the built-in\n"
-        "offline parser; only the AI chat tab is disabled.\n",
+        "Offline Smart HUD - 모델 위치 안내\n"
+        "==================================\n\n"
+        "GGUF 모델은 이 폴더가 아니라 **데이터 폴더**에 넣으세요:\n\n"
+        "    %LOCALAPPDATA%\\OfflineSmartHUD\\models\\\n\n"
+        "(탐색기 주소창에 위 경로를 그대로 붙여넣으면 열립니다.\n"
+        " AppData 는 숨김 폴더라 눈으로는 찾을 수 없습니다.)\n\n"
+        "왜 여기가 아닌가\n"
+        "----------------\n"
+        "업그레이드는 이 프로그램 폴더를 통째로 덮어쓰는 방식입니다.\n"
+        "모델을 여기에 두면 1GB 넘는 파일을 매번 다시 넣어야 합니다.\n\n"
+        "이 폴더에 있는 GGUF 도 계속 인식은 됩니다(기존 설치 호환).\n"
+        "다만 그 경우 앱이 '업그레이드 시 사라진다'고 경고합니다.\n\n"
+        "모델이 없어도 앱은 동작합니다. 일정 등록은 내장 규칙 분석기가\n"
+        "처리하고, AI 대화 탭만 비활성화됩니다.\n",
         encoding="utf-8",
     )
 
@@ -456,7 +468,8 @@ def main() -> int:
     print()
     info("NEXT STEPS")
     info(f"  1. copy the whole folder  {out}  to the target machine")
-    info("  2. drop the GGUF file into  OfflineSmartHUD/models/")
+    info("  2. drop the GGUF file into  %LOCALAPPDATA%\\OfflineSmartHUD\\models\\")
+    info("     (the DATA folder, not the program folder -- it survives upgrades)")
     info(f"  3. run  OfflineSmartHUD/{APP_NAME}.exe")
     return 0
 

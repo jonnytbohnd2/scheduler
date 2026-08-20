@@ -87,8 +87,11 @@ from llm_engine import (
     backend_info,
     build_chat_context,
     correct_false_action_claim,
+    ensure_models_dir,
     detect_tool_intent,
     find_model_path,
+    is_volatile_model,
+    models_dir,
 )
 from holidays import HOLIDAYS_FILENAME, calendar as holiday_calendar
 from outlook_service import OutlookMonitorController
@@ -1555,6 +1558,10 @@ def main() -> int:
     except Exception:                                    # noqa: BLE001
         log.exception("Holiday calendar unavailable; business days may be off")
 
+    # The GGUF lives in the data folder, so replacing the program folder to
+    # upgrade never costs a 1 GB re-copy.
+    ensure_models_dir()
+
     crash_handler.setup_logging(data, verbose="--debug" in argv)
     crash_handler.install(data, APP_NAME)
     log.info("=" * 58)
@@ -1653,7 +1660,17 @@ def main() -> int:
     log.info("Model path: %s", model or "(none)")
     if model is None:
         window.toast.show_text(
-            "AI 모델이 없어 채팅은 비활성화 상태입니다 (일정 기능은 정상)", "warn", 6000)
+            f"AI 모델이 없어 채팅은 비활성화 상태입니다 (일정 기능은 정상)\n"
+            f"모델을 넣을 곳: {models_dir()}", "warn", 8000)
+    elif is_volatile_model(model):
+        # It works, but the next folder swap deletes it. Say so once, with the
+        # destination spelled out -- AppData is hidden, so "move it" is not
+        # actionable without the path.
+        log.warning("Model sits in the program folder and will be lost on "
+                    "upgrade: %s", model)
+        window.toast.show_text(
+            f"모델이 프로그램 폴더에 있습니다. 업그레이드 시 사라집니다.\n"
+            f"이곳으로 옮기세요: {models_dir()}", "warn", 12000)
 
     app.aboutToQuit.connect(window.shutdown)
     log.info("Event loop starting")

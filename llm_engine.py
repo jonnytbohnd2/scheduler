@@ -113,21 +113,71 @@ def model_search_dirs() -> list[str]:
     return dirs
 
 
+def is_volatile_model(path: str) -> bool:
+    """True when the weights sit in the program folder rather than the data one.
+
+    Upgrading means replacing the program folder wholesale, so a model kept
+    there disappears -- and it is the one file too big to want to copy back.
+    Worth saying out loud rather than letting it vanish quietly.
+    """
+    if not path or _DATA_DIR is None:
+        return False
+    try:
+        resolved = os.path.abspath(path)
+        data_models = os.path.abspath(models_dir())
+        if os.path.commonpath([resolved, data_models]) == data_models:
+            return False
+        program = os.path.abspath(app_dir())
+        return os.path.commonpath([resolved, program]) == program
+    except (ValueError, OSError):
+        return False                 # different drives, or an odd path
+
+
+def ensure_models_dir() -> str:
+    """Create the data-folder models/ and leave a note explaining the choice."""
+    target = models_dir()
+    try:
+        os.makedirs(target, exist_ok=True)
+        note = os.path.join(target, "여기에_GGUF_모델을_넣으세요.txt")
+        if not os.path.exists(note):
+            with open(note, "w", encoding="utf-8-sig") as handle:
+                handle.write(
+                    "이 폴더에 GGUF 모델 파일을 넣으세요.\n\n"
+                    "여러 개를 넣으면 가장 최근에 넣은 파일이 선택됩니다.\n"
+                    "특정 파일을 고정하려면 설정 > AI 에서 지정하세요.\n\n"
+                    "이 폴더는 데이터 폴더라 프로그램을 새 버전으로 덮어써도\n"
+                    "지워지지 않습니다. 모델을 다시 넣을 필요가 없습니다.\n")
+    except OSError as exc:
+        log.warning("Could not prepare %s: %s", target, exc)
+    return target
+
+
 def list_models() -> list[str]:
-    """Every ``*.gguf`` across the search dirs, newest first."""
+    """Every ``*.gguf`` found, best candidate first.
+
+    Folder priority beats file age: the data folder is where the model is
+    supposed to live, and the program folder is only still searched so an
+    older install keeps working. Sorting the whole set by mtime let a stale
+    copy beside the exe win simply because it had been touched more recently
+    -- and that copy is the one an upgrade deletes.
+
+    Within a folder the newest file wins, because dropping a newer model in is
+    exactly how a swap is performed.
+    """
     found: list[str] = []
     for directory in model_search_dirs():
         if not os.path.isdir(directory):
             continue
-        found += [
+        here = [
             os.path.join(directory, name)
             for name in os.listdir(directory)
             if name.lower().endswith(".gguf")
         ]
-    try:
-        found.sort(key=os.path.getmtime, reverse=True)
-    except OSError:
-        found.sort()
+        try:
+            here.sort(key=os.path.getmtime, reverse=True)
+        except OSError:
+            here.sort()
+        found += here
     return found
 
 
@@ -2526,6 +2576,56 @@ def _selftest() -> None:  # pragma: no cover
     assert extract_json_object('```json\n{"a": 1}\n```') == {"a": 1}
     assert extract_json_object('<think>hmm</think>{"b": 2}') == {"b": 2}
     assert extract_json_object("nope") is None
+
+    # --- where the weights live -------------------------------------------- #
+    # The model must resolve out of the *data* folder, so replacing the
+    # program folder to upgrade never costs a 1 GB re-copy.
+    import tempfile as _tempfile
+    _saved_data_dir = _DATA_DIR
+    try:
+        data_root = _tempfile.mkdtemp(prefix="hud_models_data_")
+        prog_root = os.path.join(data_root, "_program")
+        os.makedirs(os.path.join(prog_root, "models"), exist_ok=True)
+        set_data_dir(data_root)
+
+        created = ensure_models_dir()
+        if not os.path.isdir(created):
+            failures += 1
+            print("FAIL 데이터 폴더에 models/ 가 안 만들어짐")
+        if not os.listdir(created):
+            failures += 1
+            print("FAIL models/ 안내 파일이 없음")
+
+        data_gguf = os.path.join(created, "data-side.gguf")
+        with open(data_gguf, "wb") as fh:
+            fh.write(b"0")
+        if is_volatile_model(data_gguf):
+            failures += 1
+            print("FAIL 데이터 폴더 모델을 휘발성으로 판단함")
+        # A path outside both folders (a user-pinned absolute path) is not
+        # ours to warn about either.
+        if is_volatile_model(os.path.join(data_root, "elsewhere.gguf")):
+            failures += 1
+            print("FAIL 데이터 폴더 밖 임의 경로를 휘발성으로 판단함")
+        # ...but one sitting beside the exe is exactly the case to flag.
+        _real_app_dir = globals()["app_dir"]
+        globals()["app_dir"] = lambda: prog_root
+        try:
+            prog_gguf = os.path.join(prog_root, "models", "prog-side.gguf")
+            with open(prog_gguf, "wb") as fh:
+                fh.write(b"0")
+            if not is_volatile_model(prog_gguf):
+                failures += 1
+                print("FAIL 프로그램 폴더 모델을 경고하지 않음")
+            # Both present -> the data-folder copy must win.
+            chosen = find_model_path("")
+            if chosen is None or os.path.abspath(chosen) != os.path.abspath(data_gguf):
+                failures += 1
+                print(f"FAIL 데이터 폴더 모델이 우선되지 않음: {chosen}")
+        finally:
+            globals()["app_dir"] = _real_app_dir
+    finally:
+        set_data_dir(_saved_data_dir or "")
 
     info = backend_info()
     print(f"\nbackend: llama_cpp={info['available']} v{info['version'] or '-'} "

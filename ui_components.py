@@ -3056,11 +3056,29 @@ class SettingsDialog(GlassDialog):
     # ---- helpers ------------------------------------------------------------ #
 
     def _model_text(self) -> str:
+        from llm_engine import find_model_path, is_volatile_model, models_dir
         configured = self.config.llm["model_path"]
-        return f"지정됨: {configured}" if configured else "자동 탐색 (models 폴더)"
+        head = f"지정됨: {configured}" if configured else "자동 탐색"
+        lines = [head, f"모델 폴더: {models_dir()}"]
+        try:
+            active = find_model_path(configured)
+        except Exception:                                # noqa: BLE001
+            active = None
+        if active is None:
+            lines.append("현재 사용 중인 모델 없음 (AI 대화 비활성화)")
+        elif is_volatile_model(active):
+            # Worth the extra line: the file is too big to want to re-copy,
+            # and AppData is hidden so "move it" needs the path spelled out.
+            lines.append(f"⚠ 모델이 프로그램 폴더에 있습니다 — 업그레이드 시 사라집니다.\n"
+                         f"    {active}\n    위 '모델 폴더'로 옮겨주세요.")
+        else:
+            lines.append(f"사용 중: {os.path.basename(active)}")
+        return "\n".join(lines)
 
     def _pick_model(self) -> None:
-        start = os.path.dirname(self.config.llm["model_path"]) or self.config.base_dir
+        from llm_engine import models_dir
+        start = (os.path.dirname(self.config.llm["model_path"])
+                 or models_dir() or self.config.base_dir)
         path, _ = QFileDialog.getOpenFileName(self, "GGUF 모델 선택", start,
                                               "GGUF 모델 (*.gguf);;모든 파일 (*.*)")
         if path:

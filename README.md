@@ -116,7 +116,9 @@ Two guards keep the verb-less path from over-firing:
 | `db_manager.py` | SQLite CRUD for both databases, thread-local connections, recurrence maths |
 | `scheduler_service.py` | APScheduler job polling the DB every 5 s, firing Qt signals |
 | `build.py` | PyInstaller `--onedir` packaging |
-| `models/` | Your GGUF file (never bundled into the exe) |
+| `holidays.py` | Korean public holidays + business-day arithmetic (offline) |
+| `test_corpus.py` | 1046 generated + curated parsing cases |
+| *data folder* `models/` | Your GGUF file — in the **data** folder, so replacing the program folder to upgrade never costs a 1 GB re-copy |
 
 ### Threads
 
@@ -250,7 +252,10 @@ folder on every launch and break the relative `./models` path.
 Deploying to the air-gapped machine:
 
 1. Copy the whole `dist/OfflineSmartHUD/` folder across
-2. Drop the `.gguf` file into `OfflineSmartHUD/models/`
+2. Drop the `.gguf` file into `%LOCALAPPDATA%\OfflineSmartHUD\models\`
+   (the **data** folder, not the program folder — it survives upgrades.
+   A model beside the exe is still read, but the app warns that the next
+   folder swap will delete it.)
 3. Run `OfflineSmartHUD.exe`
 
 ### Upgrading: replace the program folder, keep the data
