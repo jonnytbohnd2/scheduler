@@ -336,6 +336,26 @@ _WD_LIST_RE = rf"{_WD_RE}(?:{_WD_SEP}{_WD_RE})*"
 _EN_WD = (r"mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|"
           r"fri(?:day)?|sat(?:urday)?|sun(?:day)?")
 
+# English dates. Reinsurance mail is bilingual -- "1pm on August 27th JB BODA
+# 미팅" is a line pasted straight out of a broker's message, and before this
+# the month name was invisible to the parser: the time survived, the date did
+# not, and "on August 27th" ended up inside the title.
+_EN_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+              "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+_EN_MON_RE = (r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+              r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|"
+              r"nov(?:ember)?|dec(?:ember)?")
+_ORD = r"(?:st|nd|rd|th)?"
+
+#: "August 27th", "Aug 27, 2026"
+_EN_DATE_MD_RE = re.compile(
+    rf"\b(?P<mon>{_EN_MON_RE})\.?\s+(?P<day>\d{{1,2}}){_ORD}"
+    rf"(?:\s*,?\s*(?P<year>20\d{{2}}))?\b", re.I)
+#: "27 August", "27th of Aug 2026"
+_EN_DATE_DM_RE = re.compile(
+    rf"\b(?P<day>\d{{1,2}}){_ORD}\s+(?:of\s+)?(?P<mon>{_EN_MON_RE})\.?"
+    rf"(?:\s*,?\s*(?P<year>20\d{{2}}))?\b", re.I)
+
 
 def _last_day_of_month(year: int, month: int) -> int:
     return calendar.monthrange(year, month)[1]
@@ -623,6 +643,27 @@ class HeuristicParser:
                 except ValueError:
                     pass
 
+        # English month names, both orders: "August 27th", "27 Aug",
+        # "Aug 27, 2026". Reinsurance correspondence is bilingual, so a line
+        # pasted out of a London broker's mail has to work.
+        m = _EN_DATE_MD_RE.search(low) or _EN_DATE_DM_RE.search(low)
+        if m:
+            groups = m.groupdict()
+            month = _EN_MONTHS.get((groups.get("mon") or "")[:3])
+            try:
+                day = int(groups.get("day") or 0)
+            except (TypeError, ValueError):
+                day = 0
+            if month and 1 <= day <= 31:
+                year = int(groups["year"]) if groups.get("year") else now.year
+                try:
+                    candidate = date(year, month, day)
+                    if not groups.get("year") and candidate < today:
+                        candidate = date(year + 1, month, day)
+                    return candidate, 0.9, [m.span()], True
+                except ValueError:
+                    pass
+
         # --- month-relative words -----------------------------------------
         month_shift, shift_span = self._match_month_word(low)
 
@@ -818,7 +859,15 @@ class HeuristicParser:
         def tidy(text: str) -> str:
             text = re.sub(r"\b(에|에서|부터|까지|의|은|는|이|가|을|를)\b", " ", text)
             text = re.sub(r"\s+", " ", text).strip(" ,.!?~-·|")
-            return re.sub(r"(에|에서|으로|로|때)$", "", text).strip()
+            text = re.sub(r"(에|에서|으로|로|때)$", "", text).strip()
+            # Cutting an English date out of a sentence leaves its preposition
+            # behind: "1pm on August 27th JB BODA 미팅" -> "on JB BODA 미팅".
+            # Only trim at the edges -- "hands on training" must survive.
+            text = re.sub(r"^(?:(?:on|at|by|from|in|of|the|a)\b\s*)+", "",
+                          text, flags=re.I)
+            text = re.sub(r"(?:\s*\b(?:on|at|by|from|in|of|the|a)\b)+$", "",
+                          text, flags=re.I)
+            return text.strip(" ,.!?~-·|")
 
         # Prefer the version without the soft fillers, but keep them rather
         # than end up with no title at all.
@@ -2164,6 +2213,16 @@ def _selftest() -> None:  # pragma: no cover
         # Business days: deadlines here are quoted in working days.
         ("3영업일 뒤 서류 제출 등록", TOOL_ADD, "서류 제출"),
         ("다음 영업일 결재 확인 추가", TOOL_ADD, "결재 확인"),
+        # English dates -- reinsurance mail is bilingual. Reported from real
+        # use: "1pm on August 27th   JB BODA 미팅" kept the time, lost the
+        # date entirely, and filed "on August 27th JB BODA 미팅" as the title.
+        ("1pm on August 27th   JB BODA 미팅", TOOL_ADD, "JB BODA 미팅"),
+        ("Aug 27 2pm broker call", TOOL_ADD, "broker call"),
+        ("27 August 3pm renewal meeting", TOOL_ADD, "renewal meeting"),
+        ("Dec 1, 2026 treaty renewal", TOOL_ADD, "treaty renewal"),
+        ("meeting on Sep 3rd at 10am", TOOL_ADD, "meeting"),
+        # ...but a stray preposition inside a title is not a leftover.
+        ("hands on training Sep 3rd 2pm", TOOL_ADD, "hands on training"),
         # "주간보고" is a report command *and* a very common meeting title.
         ("매주 월요일 9시 주간보고", TOOL_ADD, "주간보고"),
         ("내일 10시 업무보고 등록", TOOL_ADD, "업무보고"),

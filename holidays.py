@@ -4,14 +4,21 @@
 Reinsurance deadlines are spoken in business days -- "3영업일 뒤 서류 제출",
 "다음 영업일 결재" -- so "3일 뒤" lands on a Saturday often enough to matter.
 
-There is no network here to ask a calendar service, and the lunar holidays
-(설날 · 추석 · 부처님오신날) cannot be derived from the Gregorian date, so the
-dates have to be shipped as a table. That table is the weak point of this
-module: I can state 2026-2027 with confidence and the later years are best
-treated as provisional.
+There is no network here to ask a calendar service, so the dates come from
+two places:
 
-So the file below is only a *default*. The real source of truth is
-``holidays.txt`` in the data folder, which the user owns:
+* **Computed** -- the solar holidays (신정 · 삼일절 · 어린이날 · 현충일 ·
+  광복절 · 개천절 · 한글날 · 성탄절) and every substitute day. The substitute
+  rule is written in law and deterministic, so these are correct for *any*
+  year, past or future, with no table to maintain.
+* **Tabulated** -- 설날 · 추석 · 부처님오신날 only. These follow the lunar
+  calendar and cannot be derived from a Gregorian date. ``_LUNAR`` carries
+  them through 2030; 2026-2027 are verified and the rest are provisional.
+  :meth:`HolidayCalendar.coverage_note` says so out loud, and only warns once
+  the user is actually living past the table.
+
+Whatever is in the table, the real source of truth is ``holidays.txt`` in the
+data folder, which the user owns:
 
     2026-08-15  광복절
     2026-12-24  창립기념일        <- company days off belong here too
@@ -32,78 +39,142 @@ log = logging.getLogger("holidays")
 
 HOLIDAYS_FILENAME = "holidays.txt"
 
-#: Confident: 2026-2027. Later years are carried for convenience and flagged
-#: by :func:`coverage_note` so nobody trusts them silently.
-CONFIDENT_THROUGH = 2027
+#: Solar-calendar holidays and their substitute-day eligibility.
+#: 신정 and 현충일 are the two that never get a substitute day.
+_SOLAR = (
+    ((1, 1), "신정", False),
+    ((3, 1), "삼일절", True),
+    ((5, 5), "어린이날", True),
+    ((6, 6), "현충일", False),
+    ((8, 15), "광복절", True),
+    ((10, 3), "개천절", True),
+    ((10, 9), "한글날", True),
+    ((12, 25), "성탄절", True),
+)
 
-_DEFAULTS: dict[str, str] = {
-    # ---- 2026 ----
-    "2026-01-01": "신정",
-    "2026-02-16": "설날 연휴",
-    "2026-02-17": "설날",
-    "2026-02-18": "설날 연휴",
-    "2026-03-01": "삼일절",
-    "2026-03-02": "삼일절 대체공휴일",
-    "2026-05-05": "어린이날",
-    "2026-05-24": "부처님오신날",
-    "2026-05-25": "부처님오신날 대체공휴일",
-    "2026-06-06": "현충일",
-    "2026-08-15": "광복절",
-    "2026-08-17": "광복절 대체공휴일",
-    "2026-09-24": "추석 연휴",
-    "2026-09-25": "추석",
-    "2026-09-26": "추석 연휴",
-    "2026-10-03": "개천절",
-    "2026-10-05": "개천절 대체공휴일",
-    "2026-10-09": "한글날",
-    "2026-12-25": "성탄절",
-    # ---- 2027 ----
-    "2027-01-01": "신정",
-    "2027-02-06": "설날 연휴",
-    "2027-02-07": "설날",
-    "2027-02-08": "설날 연휴",
-    "2027-02-09": "설날 대체공휴일",
-    "2027-03-01": "삼일절",
-    "2027-05-05": "어린이날",
-    "2027-05-13": "부처님오신날",
-    "2027-06-06": "현충일",
-    "2027-06-07": "현충일 대체공휴일",
-    "2027-08-15": "광복절",
-    "2027-08-16": "광복절 대체공휴일",
-    "2027-09-14": "추석 연휴",
-    "2027-09-15": "추석",
-    "2027-09-16": "추석 연휴",
-    "2027-10-03": "개천절",
-    "2027-10-04": "개천절 대체공휴일",
-    "2027-10-09": "한글날",
-    "2027-10-11": "한글날 대체공휴일",
-    "2027-12-25": "성탄절",
+#: Lunar-derived dates, which cannot be computed from the Gregorian calendar.
+#: 설날 and 추석 are the middle day; the day either side is a holiday too.
+#: {year: (설날, 추석, 부처님오신날)}
+_LUNAR = {
+    2026: ((2, 17), (9, 25), (5, 24)),
+    2027: ((2, 7), (9, 15), (5, 13)),
+    2028: ((1, 27), (10, 3), (5, 2)),
+    2029: ((2, 13), (9, 22), (5, 20)),
+    2030: ((2, 3), (9, 12), (5, 9)),
 }
 
-# Fixed-date holidays, used to keep *something* sensible past the table. The
-# lunar ones are deliberately absent -- a wrong 추석 is worse than none.
-_FIXED = {(1, 1): "신정", (3, 1): "삼일절", (5, 5): "어린이날",
-          (6, 6): "현충일", (8, 15): "광복절", (10, 3): "개천절",
-          (10, 9): "한글날", (12, 25): "성탄절"}
+#: Lunar dates up to here have been checked; the rest are carried so the app
+#: keeps working, and flagged by :func:`coverage_note` so nobody trusts them
+#: silently. Solar holidays and substitute days are *computed*, so they are
+#: correct for any year regardless of this.
+CONFIDENT_THROUGH = 2027
+
+def holidays_for_year(year: int) -> dict[date, str]:
+    """Every public holiday in `year`, substitute days included.
+
+    The substitute rule (공휴일에 관한 법률 시행령) is deterministic, so it is
+    applied rather than tabulated:
+
+    * 설날 · 추석 연휴 -- a substitute if any of the three days is a Sunday
+    * 삼일절 · 어린이날 · 부처님오신날 · 광복절 · 개천절 · 한글날 · 성탄절 --
+      a substitute if the day is a Saturday or Sunday
+    * 신정 · 현충일 -- never substituted
+
+    The substitute is the next day that is not already a holiday or a weekend.
+    """
+    days: dict[date, str] = {}
+    substitutable: list[tuple[date, str]] = []
+
+    for (month, day), name, subs in _SOLAR:
+        try:
+            when = date(year, month, day)
+        except ValueError:
+            continue
+        days[when] = name
+        if subs:
+            substitutable.append((when, name))
+
+    lunar = _LUNAR.get(year)
+    if lunar:
+        (sm, sd), (cm, cd), (bm, bd) = lunar
+        for month, day, label in ((sm, sd, "설날"), (cm, cd, "추석")):
+            try:
+                middle = date(year, month, day)
+            except ValueError:
+                continue
+            block = [middle - timedelta(days=1), middle, middle + timedelta(days=1)]
+            # A day of the block already taken means it lands on another
+            # public holiday -- 2028 추석 (10/2-10/4) covers 개천절 on 10/3.
+            collides = any(d in days for d in block)
+            for offset, when in enumerate(block):
+                days.setdefault(when, label if offset == 1 else f"{label} 연휴")
+            # One substitute per block: a Sunday inside it, or an overlap with
+            # another holiday. Both are grounds under 공휴일에 관한 법률 시행령.
+            if collides or any(d.weekday() == 6 for d in block):
+                substitutable.append((block[-1], f"{label} 대체공휴일"))
+        try:
+            buddha = date(year, bm, bd)
+            days[buddha] = "부처님오신날"
+            substitutable.append((buddha, "부처님오신날"))
+        except ValueError:
+            pass
+
+    for when, name in substitutable:
+        if name.endswith("대체공휴일"):
+            needs = True                       # 설날/추석 block, decided above
+        else:
+            needs = when.weekday() >= 5        # Saturday or Sunday
+        if not needs:
+            continue
+        probe = when + timedelta(days=1)
+        for _ in range(10):
+            if probe not in days and probe.weekday() < 5:
+                base = name.replace(" 대체공휴일", "")
+                days[probe] = f"{base} 대체공휴일"
+                break
+            probe += timedelta(days=1)
+    return days
 
 
 class HolidayCalendar:
     """Public holidays plus whatever the user added, with business-day maths."""
 
+    #: Years generated up front. Anything outside is produced on demand, so a
+    #: date far in the future never silently reports "not a holiday".
+    SPAN_BEFORE, SPAN_AFTER = 2, 6
+
     def __init__(self, data_dir: Optional[str] = None) -> None:
         self._map: dict[date, str] = {}
+        self._generated: set[int] = set()
+        self._custom: dict[date, Optional[str]] = {}
         self._custom_path: Optional[str] = None
-        self._load_defaults()
+        this_year = date.today().year
+        for year in range(this_year - self.SPAN_BEFORE, this_year + self.SPAN_AFTER):
+            self._ensure_year(year)
         if data_dir:
             self.load_user_file(os.path.join(data_dir, HOLIDAYS_FILENAME))
 
     # -- loading --------------------------------------------------------- #
-    def _load_defaults(self) -> None:
-        for text, name in _DEFAULTS.items():
-            try:
-                self._map[date.fromisoformat(text)] = name
-            except ValueError:
-                log.warning("Bad built-in holiday date %r", text)
+    def _ensure_year(self, year: int) -> None:
+        """Generate a year on first use, then re-apply the user's overrides.
+
+        The overrides have to win: a generated year arriving later must not
+        resurrect a public holiday the user cancelled with '-'.
+        """
+        if year in self._generated:
+            return
+        self._generated.add(year)
+        try:
+            self._map.update(holidays_for_year(year))
+        except Exception:                                # noqa: BLE001
+            log.exception("Could not build holidays for %d", year)
+        for day, name in self._custom.items():
+            if day.year != year:
+                continue
+            if name is None:
+                self._map.pop(day, None)
+            else:
+                self._map[day] = name
 
     def load_user_file(self, path: str) -> int:
         """Merge ``holidays.txt``. Returns how many lines were applied."""
@@ -126,10 +197,14 @@ class HolidayCalendar:
                     except ValueError:
                         log.warning("%s:%d 날짜 형식이 아닙니다: %r", path, lineno, raw.strip())
                         continue
+                    self._ensure_year(day.year)
                     if remove:
+                        self._custom[day] = None
                         self._map.pop(day, None)
                     else:
-                        self._map[day] = parts[1].strip() if len(parts) > 1 else "휴일"
+                        label = parts[1].strip() if len(parts) > 1 else "휴일"
+                        self._custom[day] = label
+                        self._map[day] = label
                     applied += 1
         except OSError as exc:
             log.warning("Could not read %s: %s", path, exc)
@@ -162,12 +237,8 @@ class HolidayCalendar:
     def holiday_name(self, day: date) -> Optional[str]:
         if isinstance(day, datetime):
             day = day.date()
-        if day in self._map:
-            return self._map[day]
-        # Past the shipped table, still honour the fixed-date holidays.
-        if day.year > max(d.year for d in self._map):
-            return _FIXED.get((day.month, day.day))
-        return None
+        self._ensure_year(day.year)
+        return self._map.get(day)
 
     def is_holiday(self, day: date) -> bool:
         return self.holiday_name(day) is not None
@@ -236,16 +307,36 @@ class HolidayCalendar:
 
     # -- reporting ------------------------------------------------------- #
     def coverage_note(self) -> str:
-        last = max(self._map) if self._map else None
-        note = (f"기본 공휴일 {CONFIDENT_THROUGH}년까지 확인됨"
-                f" (표는 {last.year if last else '-'}년까지)")
+        """What the calendar actually knows, stated plainly.
+
+        Solar holidays and substitute days are computed and hold for any year.
+        Only the lunar ones need a table, so that is the part worth warning
+        about -- and only once the user is actually living in those years.
+        """
+        year = date.today().year
+        parts = ["양력 공휴일·대체공휴일은 자동 계산"]
+        lunar_last = max(_LUNAR) if _LUNAR else 0
+        if year > lunar_last:
+            parts.append(f"⚠ 음력 공휴일(설날·추석·부처님오신날) {lunar_last}년까지만 "
+                         f"수록 — holidays.txt 에 추가 필요")
+        elif year > CONFIDENT_THROUGH:
+            parts.append(f"음력 공휴일 {lunar_last}년까지 수록 "
+                         f"({CONFIDENT_THROUGH}년까지 검증)")
+        else:
+            parts.append(f"음력 공휴일 {lunar_last}년까지 수록")
         if self._custom_path and os.path.isfile(self._custom_path):
-            note += " · holidays.txt 반영됨"
-        return note
+            parts.append("holidays.txt 반영됨")
+        return " · ".join(parts)
+
+    def lunar_years(self) -> tuple[int, int]:
+        """(verified through, tabulated through) for the lunar holidays."""
+        return CONFIDENT_THROUGH, (max(_LUNAR) if _LUNAR else 0)
 
     def upcoming(self, start: date, days: int = 90) -> list[tuple[date, str]]:
         if isinstance(start, datetime):
             start = start.date()
+        self._ensure_year(start.year)
+        self._ensure_year((start + timedelta(days=days)).year)
         out = []
         for offset in range(days):
             day = start + timedelta(days=offset)
@@ -328,9 +419,47 @@ if __name__ == "__main__":                                       # self-test
     check("잘못된 줄은 무시", cal2.is_business_day(date(2026, 8, 20)))
     check("커버리지 안내", "holidays.txt" in cal2.coverage_note(), cal2.coverage_note())
 
-    # beyond the table we still know the fixed holidays, and never crash
-    check("표 이후 고정 공휴일", not cal.is_business_day(date(2031, 1, 1)))
-    check("표 이후 평일", cal.is_business_day(date(2031, 1, 2)))
+    # --- computed substitute days ------------------------------------------ #
+    # 2026: 삼일절 Sun -> Mon 3/2, 광복절 Sat -> Mon 8/17,
+    #       개천절 Sat -> Mon 10/5, 부처님오신날 Sun -> Mon 5/25
+    for when, label in ((date(2026, 3, 2), "삼일절"),
+                        (date(2026, 8, 17), "광복절"),
+                        (date(2026, 10, 5), "개천절"),
+                        (date(2026, 5, 25), "부처님오신날")):
+        got = cal.holiday_name(when)
+        check(f"2026 {label} 대체", got is not None and "대체" in got, f"{when} -> {got}")
+    # 한글날 2026-10-09 is a Friday: a weekday, so no substitute is due.
+    check("평일 공휴일엔 대체 없음", cal.holiday_name(date(2026, 10, 12)) is None,
+          str(cal.holiday_name(date(2026, 10, 12))))
+    # 신정과 현충일은 주말에 걸려도 대체가 없다. 2027-01-01 is a Friday;
+    # 2026-06-06 현충일 is a Saturday -> the following Monday stays a workday.
+    check("현충일은 대체 없음", cal.is_business_day(date(2026, 6, 8)),
+          str(cal.holiday_name(date(2026, 6, 8))))
+
+    # 2028: the 추석 block (10/2-10/4) swallows 개천절 on 10/3, which earns a
+    # substitute even though no Sunday is involved.
+    y2028 = holidays_for_year(2028)
+    check("연휴가 다른 공휴일과 겹치면 대체",
+          any("추석 대체" in n for n in y2028.values()),
+          str(sorted((str(d), n) for d, n in y2028.items() if d.month == 10)))
+
+    # A year with no lunar data still yields the solar holidays and never
+    # invents a 추석 -- a wrong lunar date is worse than a missing one.
+    far = holidays_for_year(2035)
+    check("표 밖 연도: 양력 공휴일 계산됨", far.get(date(2035, 3, 1)) == "삼일절")
+    check("표 밖 연도: 음력 공휴일 없음",
+          not any("추석" in n or "설날" in n for n in far.values()))
+    check("표 밖 연도에도 안 죽음", not cal.is_business_day(date(2035, 1, 1)))
+    check("표 밖 평일", cal.is_business_day(date(2035, 1, 2)))
+
+    # A cancelled holiday must stay cancelled when its year is generated late.
+    tmp2 = tempfile.mkdtemp(prefix="hol2_")
+    with open(os.path.join(tmp2, HOLIDAYS_FILENAME), "w", encoding="utf-8") as fh:
+        fh.write("-2033-03-01\n2033-07-07  창립기념일\n")
+    late = HolidayCalendar(tmp2)
+    check("나중에 생성된 연도에도 취소 유지", late.is_business_day(date(2033, 3, 1)),
+          str(late.holiday_name(date(2033, 3, 1))))
+    check("나중에 생성된 연도에도 추가 유지", not late.is_business_day(date(2033, 7, 7)))
 
     ups = cal.upcoming(date(2026, 9, 1), 40)
     check("다가오는 휴일", any(n.startswith("추석") for _, n in ups), str(ups))
