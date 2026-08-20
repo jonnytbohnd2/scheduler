@@ -760,6 +760,12 @@ class TitleBar(QWidget):
 
     def set_clock(self, text: str) -> None:
         self.clock.setText(text)
+        # The title bar is a single tight row; with "초 단위 시계" on, its
+        # natural width exceeds the default 290 px window and the layout takes
+        # the space back out of the clock, chopping the seconds off. Pinning
+        # the clock to what it needs makes the stretch give way instead.
+        self.clock.setMinimumWidth(
+            QFontMetrics(self.clock.font()).horizontalAdvance(text or "00:00"))
 
     def set_badge(self, text: str) -> None:
         """Small count pill (e.g. overdue items) shown next to the clock."""
@@ -803,9 +809,7 @@ class ElidedLabel(QLabel):
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
     def setText(self, text: str) -> None:  # noqa: N802
-        self._full = text
-        super().setText(text)
-        self.setToolTip(text)
+        self._full = text or ""
         self._elide()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -814,7 +818,11 @@ class ElidedLabel(QLabel):
 
     def _elide(self) -> None:
         metrics = QFontMetrics(self.font())
-        super().setText(metrics.elidedText(self._full, Qt.ElideRight, max(20, self.width())))
+        shown = metrics.elidedText(self._full, Qt.ElideRight, max(20, self.width()))
+        super().setText(shown)
+        # A tooltip only earns its keep when something is actually hidden --
+        # otherwise every label in the panel sprouts a redundant popup.
+        self.setToolTip(self._full if shown != self._full else "")
 
 
 class TagChip(QLabel):

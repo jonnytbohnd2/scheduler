@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSizeGrip,
+    QSizePolicy,
     QSystemTrayIcon,
     QTabWidget,
     QVBoxLayout,
@@ -94,6 +95,7 @@ from ui_components import (
     FILTER_ALL,
     ChatInput,
     ChatView,
+    ElidedLabel,
     EmailActionCard,
     GlassPanel,
     ManualScheduleDialog,
@@ -262,10 +264,12 @@ class HudWindow(QWidget):
         strip.setSpacing(6)
         self.summary_label = QLabel("")
         self.summary_label.setObjectName("muted")
+        self.summary_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         strip.addWidget(self.summary_label)
         strip.addStretch(1)
-        self.next_label = QLabel("")
-        strip.addWidget(self.next_label)
+        # "다음 …"는 제목 길이에 따라 얼마든지 길어진다 -- 남는 폭에 맞춰 줄인다.
+        self.next_label = ElidedLabel("")
+        strip.addWidget(self.next_label, 1)
         self.schedule_layout.addWidget(self.summary_row)
 
         self.filter_bar = ScheduleFilterBar()
@@ -724,8 +728,10 @@ class HudWindow(QWidget):
         upcoming = [s for s in open_items if s.target_time > now]
         if upcoming:
             nxt = min(upcoming, key=lambda s: s.target_time)
+            # No character-count trim: ElidedLabel cuts to the real pixel width
+            # and keeps the whole line in a tooltip.
             self.next_label.setText(
-                f"다음 {nxt.title[:12]} · {humanize_countdown(nxt.seconds_left(now))}")
+                f"다음 {nxt.title} · {humanize_countdown(nxt.seconds_left(now))}")
         else:
             self.next_label.setText("")
 
