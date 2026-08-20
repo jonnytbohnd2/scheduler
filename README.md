@@ -290,6 +290,18 @@ are no binary art assets to ship.
 
 ## Self-tests
 
+```
+py test_corpus.py     # 111 phrases a Korean reinsurance office would type
+```
+
+`test_corpus.py` exists because the author's own test cases kept missing what
+the user actually typed -- `8/24`, `1pm on August 27th`, `1/2 시무식`. Each
+entry pins the tool, the exact title and the exact resulting datetime, with
+`NOW` fixed to a **Friday** (business-day and "next week" logic behaves
+differently at the end of a week). Roughly a third of the cases assert that
+something is *not* a schedule.
+
+
 Each module is runnable on its own and has no external test dependencies:
 
 ```bash

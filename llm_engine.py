@@ -232,7 +232,18 @@ class ParseResult:
         words alone ("점심 뭐 먹지") are deliberately *not* definite -- they
         would otherwise turn idle chatter into alarms.
         """
-        return bool(self.usable and (self.explicit_date or self.explicit_time))
+        if not (self.usable and (self.explicit_date or self.explicit_time)):
+            return False
+        # A date on its own is not a task. "8/24" left nothing behind but the
+        # filler word, and filing an item called "일정" helps no one -- send it
+        # to the confirm dialog instead, where a title can be typed.
+        if self.title in _EMPTY_TITLES:
+            return False
+        # Past tense is a statement, not a request: "3일 걸렸어" is someone
+        # reporting how long something took, not booking the 3rd.
+        if _PAST_TENSE_RE.search(self.raw_text or ""):
+            return False
+        return True
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -257,6 +268,16 @@ class ParseResult:
 # --------------------------------------------------------------------------- #
 # Heuristic natural-language parser
 # --------------------------------------------------------------------------- #
+
+#: What is left when the text was a bare date. Not worth a schedule row.
+_EMPTY_TITLES = frozenset(
+    ("", "일정", "스케줄", "할일", "할 일", "todo", "건", "알람", "알림"))
+
+#: Past-tense endings. "3일 걸렸어" reports how long something took; without
+#: this it booked the 3rd of the month.
+_PAST_TENSE_RE = re.compile(
+    r"(?:했|였|았|었|봤|왔|갔|줬|썼|끝냈|마쳤|받았|보냈|걸렸|됐|되었)"
+    r"\s*(?:어|다|음|네|지|는데|고|으며|습니다|어요|아요)?\s*[.!]?\s*$")
 
 _NUM_KO = {
     "한": 1, "두": 2, "세": 3, "네": 4, "다섯": 5, "여섯": 6, "일곱": 7,
@@ -631,6 +652,12 @@ class HeuristicParser:
             r"(?<![\d/.\-])(\d{1,2})\s*/\s*(\d{1,2})"
             r"(?![\d/.\-])(?!\s*(?:정도|쯤|가량|만큼|수준|밖에|이상|이하|짜리|배))",
             low)
+        if not m:
+            # "8.24" is the other shorthand people type. A dot is also the
+            # decimal point, so this form only counts when a space or the end
+            # of the line follows -- that keeps "1.5시간" and "3.5B 모델" out,
+            # and the lookbehind keeps it from biting into "2026.7월".
+            m = re.search(r"(?<![\d.\-])(\d{1,2})\.(\d{1,2})(?![\d.])(?=\s|$)", low)
         if m:
             month, day = int(m.group(1)), int(m.group(2))
             if 1 <= month <= 12 and 1 <= day <= 31:
@@ -749,10 +776,22 @@ class HeuristicParser:
         if m:
             days = parse_weekdays(m.group(2))
             if days:
-                offset = (days[0] - today.weekday()) % 7
                 prefix = (m.group(1) or "").replace(" ", "")
-                if prefix in ("다음주", "담주", "차주", "nextweek"):
-                    offset += 7
+                if prefix:
+                    # "다음주 월요일" means the Monday of next *calendar* week,
+                    # not "the coming Monday, plus seven". On a Friday those
+                    # differ by a week: the coming Monday is already next
+                    # week's, so adding seven overshot to the week after.
+                    week_start = today - timedelta(days=today.weekday())
+                    if prefix in ("다음주", "담주", "차주", "nextweek"):
+                        week_start += timedelta(days=7)
+                    target = week_start + timedelta(days=days[0])
+                    # "이번주 수요일" said on Thursday means the coming one --
+                    # nobody schedules into the past.
+                    if target < today:
+                        target += timedelta(days=7)
+                    return target, 0.8, [m.span()], True
+                offset = (days[0] - today.weekday()) % 7
                 return today + timedelta(days=offset), 0.8, [m.span()], True
 
         m = re.search(r"(다음\s*주|담주|차주|next\s+week)", low)
@@ -803,10 +842,17 @@ class HeuristicParser:
             if 0 <= hour <= 23 and 0 <= minute <= 59:
                 return (hour, minute), 0.95, [m.span()], True, True
 
-        # N시 (반 | N분), digits or Korean numerals
+        # N시 (반 | N분), digits or Korean numerals.
+        #
+        # 시 has to be the whole syllable, not the head of another word:
+        # "1/2 시무식" was read as 2 o'clock and filed as "무식", and
+        # "2시간 걸렸어" became a 14:00 alarm titled "간 걸렸어". So 시 must be
+        # followed by a non-Hangul character, or by one of the few particles
+        # that really do trail a clock reading.
         m = re.search(
             r"(오전|오후|아침|저녁|밤|새벽)?\s*"
             r"(\d{1,2}|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열두|열한|열)\s*시"
+            r"(?:(?![가-힣])|(?=\s*(?:반|정각|분|경|쯤|까지|부터|에|께|이후|이전)))"
             r"\s*(반|\d{1,2}\s*분|정각)?",
             low,
         )
@@ -863,8 +909,8 @@ class HeuristicParser:
             # Cutting an English date out of a sentence leaves its preposition
             # behind: "1pm on August 27th JB BODA 미팅" -> "on JB BODA 미팅".
             # Only trim at the edges -- "hands on training" must survive.
-            text = re.sub(r"^(?:(?:on|at|by|from|in|of|the|a)\b\s*)+", "",
-                          text, flags=re.I)
+            text = re.sub(r"^(?:(?:on|at|by|from|in|of|the|a|next|this|coming|"
+                          r"last)\b\s*)+", "", text, flags=re.I)
             text = re.sub(r"(?:\s*\b(?:on|at|by|from|in|of|the|a)\b)+$", "",
                           text, flags=re.I)
             return text.strip(" ,.!?~-·|")
@@ -992,7 +1038,7 @@ _LIST_RE = re.compile(
     r"있(?:어|나|니|는지)|남았|list|show|what)"
 )
 _LIST_RE_ALT = re.compile(
-    r"(오늘|내일|이번\s*주|금주|이번\s*달|전체|모든)\s*"
+    r"(오늘|내일|이번\s*주|금주|이번\s*달|전체|모든|남은|밀린|안\s*끝난)\s*"
     r"(일정|스케줄|할\s*일|할일|todo|약속|task)"
 )
 
@@ -1007,7 +1053,11 @@ _CLEAR_RE = re.compile(
 )
 
 _DELETE_RE = re.compile(
-    r"(?P<title>.+?)\s*(일정|약속|알람)?\s*(삭제|지워|취소|없애|빼|remove|delete|cancel)\s*(해\s*줘|해줘)?$"
+    # "지워줘" is 지워 + 줘, not 지워 + 해줘 -- requiring the 해 meant the most
+    # natural way to say it fell through to chat.
+    r"(?P<title>.+?)\s*(일정|약속|알람)?\s*"
+    r"(삭제|지워|취소|없애|빼|remove|delete|cancel)\s*"
+    r"(?:(?:해\s*)?(?:줘|주세요|주라|줄래))?$"
 )
 
 # "'특약OS이월' 메일 오면 '결재 승인' 리마인드해줘"
@@ -1035,7 +1085,7 @@ _DELETE_EMAIL_RE = re.compile(
 # "기다리는 메일 목록", "메일 알림 리스트", "메일 리마인더"
 _LIST_EMAIL_RE = re.compile(
     r"(기다리(?:는|던)\s*(?:메일|이메일)"
-    r"|(?:메일|이메일)\s*(?:알림|리마인더|대기|감지)\s*(?:목록|리스트|현황|규칙)?"
+    r"|(?:메일|이메일)\s*(?:알림|리마인더|대기|감지|규칙)\s*(?:목록|리스트|현황|규칙)?"
     r"|(?:대기|등록)\s*(?:중인?)?\s*(?:메일|이메일)"
     r"|(?:메일|이메일)\s*(?:목록|리스트)"
     r"|email\s*reminder)",
