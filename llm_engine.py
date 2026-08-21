@@ -284,6 +284,15 @@ class ParseResult:
         """
         if not (self.usable and (self.explicit_date or self.explicit_time)):
             return False
+        # Pasted material is not a command. An email asking for a reply draft
+        # was filed as a schedule titled with its own 652-character body,
+        # because "Sent: Monday" parsed as a date -- and the reply the user
+        # actually asked for never happened.
+        raw = self.raw_text or ""
+        if len(self.title) > MAX_TITLE_CHARS or looks_pasted(raw):
+            return False
+        if _COMPOSE_RE.search(raw):
+            return False
         # A date on its own is not a task. "8/24" left nothing behind but the
         # filler word, and filing an item called "일정" helps no one -- send it
         # to the confirm dialog instead, where a title can be typed.
@@ -318,6 +327,42 @@ class ParseResult:
 # --------------------------------------------------------------------------- #
 # Heuristic natural-language parser
 # --------------------------------------------------------------------------- #
+
+#: A task name is short. Anything longer is pasted content that happens to
+#: contain a date -- an email body registered itself as a 652-character
+#: schedule because "Sent: Monday" was in the headers.
+MAX_TITLE_CHARS = 80
+
+#: Two or more of these means the text was pasted, not typed as a command.
+_PASTE_MARKERS = (
+    "from:", "sent:", "to:", "cc:", "bcc:", "subject:", "reply-to:",
+    "보낸사람:", "받는사람:", "받는 사람:", "수신:", "발신:", "참조:", "제목:",
+    "보낸 날짜:", "회신:", "best regards", "kind regards", "감사합니다\n",
+)
+
+#: "이 메일 답장 써줘", "write me a response to below email" -- a request to
+#: compose something, which must reach the model rather than the database.
+_COMPOSE_RE = re.compile(
+    r"(답장|회신|답변)\s*(을|를)?\s*(써|작성|보내|드래프트|초안)"
+    r"|(써|작성)\s*(줘|주세요|해줘|해\s*주)"
+    r"|write\s+(me\s+)?(a\s+)?(reply|response|email|draft)"
+    r"|draft\s+(a\s+)?(reply|response|email)"
+    r"|reply\s+to\s+(this|the|below)",
+    re.IGNORECASE,
+)
+
+
+def looks_pasted(text: str) -> bool:
+    """True when the text is quoted material rather than an instruction."""
+    if not text:
+        return False
+    low = text.lower()
+    hits = sum(1 for marker in _PASTE_MARKERS if marker in low)
+    if hits >= 2:
+        return True
+    # An address plus any header line is enough on its own.
+    return hits >= 1 and bool(re.search(r"[\w.+-]+@[\w.-]+\.\w{2,}", low))
+
 
 #: What is left when the text was a bare date. Not worth a schedule row.
 _EMPTY_TITLES = frozenset(
@@ -1394,9 +1439,22 @@ def correct_false_action_claim(text: str) -> str:
 #: they just start their answer with an untagged English reasoning monologue.
 #: Recognising it lets the UI show "생각하는 중…" instead of streaming the
 #: model's scratch work into the chat bubble.
+#: The closing tag, used on its own by templates that open the block for
+#: the model. Defined before the helpers that need it.
+CLOSE_THINK = "</think>"
+
 PREAMBLE_RE = re.compile(
-    r"^\s*(thinking\s+process|thought\s+process|reasoning|let\s+me\s+think|"
-    r"analysis|first,?\s+i\s+need\s+to|okay,?\s+the\s+user)\b[:\s]",
+    r"^\s*(?:"
+    r"(?:thinking\s+process|thought\s+process|reasoning|let\s+me\s+think|"
+    r"analysis|first,?\s+i\s+need\s+to|okay,?\s+the\s+user)\b[:\s]"
+    # Plain narration, which is what these models actually produce:
+    # "The user is asking for help writing an email in English."
+    r"|the\s+user\s+(?:is|was|wants|asks|asked|needs|seems)\b"
+    r"|i\s+(?:should|need\s+to|will)\s+(?:provide|explain|respond|answer|keep)\b"
+    # ...and the Korean equivalent: "사용자가 AI 비서의 능력을 묻는 질문입니다."
+    r"|사용자(?:가|는|의|께서)\s"
+    r"|(?:먼저|우선)\s+\S{0,12}(?:해야|확인|파악)"
+    r")",
     re.IGNORECASE,
 )
 
@@ -1414,7 +1472,16 @@ def strip_reasoning_preamble(text: str) -> str:
     returned unchanged. Losing the model's only output would be worse than
     showing its scratch work.
     """
-    if not text or not PREAMBLE_RE.match(text):
+    if not text:
+        return text
+
+    # An explicit end-of-reasoning tag beats every heuristic below. Qwen3's
+    # template opens the block in the prompt, so the only tag in the output is
+    # the closing one -- everything before it is scratch work, by definition.
+    if CLOSE_THINK in text:
+        return text.rsplit(CLOSE_THINK, 1)[1].strip()
+
+    if not PREAMBLE_RE.match(text):
         return text
 
     low = text.lower()
@@ -1465,6 +1532,14 @@ class ThinkFilter:
         self.used_preamble = False      # sticky: survives flush(), for warnings
         self._sniffed = False
         self._seen = ""
+        #: True once a literal "<think>" has been seen in the output. Until
+        #: then a lone "</think>" means the template opened the block for us.
+        self.saw_open = False
+        #: Reasoning that reached the UI before we knew it was reasoning.
+        self.retracted = False
+        #: Everything handed out as answer text -- the authoritative result,
+        #: because a retraction has to be able to take earlier output back.
+        self.emitted = ""
 
     @staticmethod
     def _partial_tail(text: str, tag: str) -> int:
@@ -1502,8 +1577,26 @@ class ThinkFilter:
         while True:
             if not self.in_think:
                 index = self.buffer.find(self.OPEN)
+                # A closing tag with no opening one: Qwen3's chat template puts
+                # "<think>" into the *prompt*, so the model generates only the
+                # reasoning and the closing tag. Nothing here ever sees an OPEN,
+                # and the monologue was being shown to the user verbatim.
+                # Everything up to that CLOSE was reasoning -- retract it.
+                if not self.saw_open:
+                    close_at = self.buffer.find(self.CLOSE)
+                    if close_at != -1 and (index == -1 or close_at < index):
+                        self.thoughts += self.emitted + "".join(out)
+                        self.thoughts += self.buffer[:close_at]
+                        self.used_preamble = True
+                        self.retracted = True
+                        self.emitted = ""
+                        out = []
+                        self.buffer = self.buffer[close_at + len(self.CLOSE):]
+                        continue
                 if index == -1:
-                    keep = self._partial_tail(self.buffer, self.OPEN)
+                    keep = max(self._partial_tail(self.buffer, self.OPEN),
+                               0 if self.saw_open
+                               else self._partial_tail(self.buffer, self.CLOSE))
                     if keep:
                         out.append(self.buffer[:-keep])
                         self.buffer = self.buffer[-keep:]
@@ -1514,6 +1607,7 @@ class ThinkFilter:
                 out.append(self.buffer[:index])
                 self.buffer = self.buffer[index + len(self.OPEN):]
                 self.in_think = True
+                self.saw_open = True
             else:
                 index = self.buffer.find(self.CLOSE)
                 if index == -1:
@@ -1524,7 +1618,9 @@ class ThinkFilter:
                 self.thoughts += self.buffer[:index]
                 self.buffer = self.buffer[index + len(self.CLOSE):]
                 self.in_think = False
-        return "".join(out)
+        shown = "".join(out)
+        self.emitted += shown
+        return shown
 
     def flush(self) -> str:
         """Release anything held back once the stream ends."""
@@ -1536,13 +1632,19 @@ class ThinkFilter:
             answer = strip_reasoning_preamble(self.thoughts).strip()
             self.in_preamble = False
             self.thoughts = ""
+            self.emitted += answer
             return answer
         if not self._sniffed and self._seen:      # very short reply
+            # Held back entirely, so it never went through the tag scanner --
+            # run it now, or a brief answer keeps its <think> block.
             self._sniffed = True
             tail, self._seen = self._seen, ""
+            tail = strip_think(tail, self.mode)
+            self.emitted += tail
             return tail
         tail = "" if self.in_think else self.buffer
         self.buffer = ""
+        self.emitted += tail
         return tail
 
     @property
@@ -1609,7 +1711,20 @@ CHAT_SYSTEM_PROMPT = (
     "\n"
     "일정 관련:\n"
     "- 사용자가 일정이나 할 일을 말씀하시면, 상단 일정 입력창을 이용하시거나 "
-    "'추가해줘'를 붙여 말씀해 달라고 안내해라. 날짜와 시간을 임의로 지어내지 않는다."
+    "'추가해줘'를 붙여 말씀해 달라고 안내해라. 날짜와 시간을 임의로 지어내지 않는다.\n"
+    "\n"
+    # Without this the model answers as a generic chatbot: asked about Outlook
+    # it replied "No, I cannot access your Outlook or any personal accounts",
+    # which is wrong -- the app watches the inbox and the user was told so.
+    # It must not deny what the program around it actually does.
+    "이 프로그램이 할 수 있는 일 (너 자신은 못 하더라도 앱은 한다):\n"
+    "- 일정 등록·조회·삭제, 반복 일정, 알림과 놓친 알림 재알림\n"
+    "- Outlook 받은편지함 감시: 특정 키워드의 메일이 오면 알림을 띄운다. "
+    "(\"'특약OS이월' 메일 오면 '결재 승인' 리마인드해줘\" 처럼 등록)\n"
+    "- Outlook 오늘 일정 표시, 영업일 계산, 주간 업무 보고 만들기\n"
+    "- 사용자가 이런 기능을 물으면 \"할 수 없다\"고 하지 말고 어떻게 쓰는지 안내해라.\n"
+    "- 다만 네가 직접 메일을 열거나 보낼 수는 없다. 메일 내용을 붙여넣어 주시면 "
+    "읽고 답장 초안을 써 줄 수 있다고 안내해라."
 )
 
 SCHEDULE_SYSTEM_PROMPT = """You turn a message into ONE JSON object. Output JSON only.
@@ -1971,7 +2086,11 @@ class LlmWorker(QObject):
             if was_thinking:
                 self.chat_thinking.emit(request_id, False)
 
-            answer = "".join(visible).strip()
+            # `emitted` rather than the streamed list: a late "</think>"
+            # retracts reasoning that was already sent to the UI, and
+            # end_stream() replaces the bubble with this value.
+            answer = (think.emitted if think.retracted
+                      else "".join(visible)).strip()
             if think.had_untagged_reasoning:
                 # The model ignored /no_think and wrote its scratch work in the
                 # open. Say so once instead of leaving the user to wonder.
@@ -2630,6 +2749,59 @@ def _selftest() -> None:  # pragma: no cover
             globals()["app_dir"] = _real_app_dir
     finally:
         set_data_dir(_saved_data_dir or "")
+
+    # --- reasoning that arrives without its opening tag ---------------------- #
+    # Reported from real use with Qwen3.8-4B. The chat template writes
+    # "<think>" into the *prompt*, so the completion is reasoning followed by a
+    # bare "</think>" -- the filter waited for an OPEN that never came and put
+    # the monologue on screen.
+    REAL = ("사용자가 AI 비서의 능력을 묻는 질문입니다. 역할 설정에 따라 업무 보조, "
+            "일정 관리, 정보 제공 등의 기능을 안내해야 합니다.\n</think>\n\n"
+            "- 업무 관련 문의나 요청을 도와드릴 수 있습니다.\n"
+            "- 일정 입력 및 알림 기능도 지원합니다.")
+    REAL_EN = ("The user is asking for help writing an email in English. I should "
+               "provide a polite and concise response.\n</think>\n\n"
+               "- Of course! What would you like to write?")
+
+    for label, raw in (("ko", REAL), ("en", REAL_EN)):
+        for chunk_size in (len(raw), 7, 1):        # whole, chunked, token-wise
+            f = ThinkFilter("hide")
+            for i in range(0, len(raw), chunk_size):
+                f.feed(raw[i:i + chunk_size])
+            f.flush()
+            shown = f.emitted.strip()
+            if "</think>" in shown or "사용자가" in shown or "The user is" in shown:
+                failures += 1
+                print(f"FAIL 사고 과정이 새어나감 ({label}, chunk={chunk_size}): "
+                      f"{shown[:70]!r}")
+            if "도와드릴 수 있습니다" not in shown and "Of course" not in shown:
+                failures += 1
+                print(f"FAIL 실제 답변이 사라짐 ({label}, chunk={chunk_size}): {shown[:70]!r}")
+
+    # A normal answer with no reasoning at all must pass through untouched.
+    plain = "내일 오전 10시로 등록했습니다. 다른 도움이 필요하시면 말씀해 주세요."
+    f = ThinkFilter("hide")
+    for ch in plain:
+        f.feed(ch)
+    f.flush()
+    if f.emitted.strip() != plain:
+        failures += 1
+        print(f"FAIL 평범한 답변이 변형됨: {f.emitted.strip()[:70]!r}")
+
+    # Properly tagged reasoning still works.
+    tagged = "<think>hmm, let me see</think>답변입니다."
+    f = ThinkFilter("hide")
+    f.feed(tagged)
+    f.flush()
+    if f.emitted.strip() != "답변입니다.":
+        failures += 1
+        print(f"FAIL 태그된 사고 과정 처리 실패: {f.emitted.strip()!r}")
+
+    # mode='show' keeps everything, including the tags.
+    f = ThinkFilter("show")
+    if f.feed(REAL) != REAL:
+        failures += 1
+        print("FAIL show 모드가 내용을 바꿈")
 
     info = backend_info()
     print(f"\nbackend: llama_cpp={info['available']} v{info['version'] or '-'} "

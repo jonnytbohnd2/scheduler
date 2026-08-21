@@ -1634,9 +1634,18 @@ class ChatInput(QWidget):
     def apply_style(self) -> None:
         s = style()
         self.row.setSpacing(max(2, s.gap - 1))
-        self._min_h = s.ctl_h
-        self._max_h = s.ctl_h * 4
+        # Two lines at rest rather than one: a single line makes anything
+        # longer than a sentence feel cramped, and pasting an email into a
+        # 24 px slot gives no sense of what was pasted. Grows to about nine.
+        line = QFontMetrics(self.edit.font()).lineSpacing()
+        self._pad = 12
+        self._min_h = max(s.ctl_h, line * 2 + self._pad)
+        self._max_h = line * 9 + self._pad
         self.edit.setFixedHeight(self._min_h)
+        # The buttons sit beside a taller box now; keep them at the top so the
+        # composer grows downward instead of the icons drifting to the middle.
+        for btn in (self.clear_btn, self.send_btn, self.stop_btn):
+            self.row.setAlignment(btn, Qt.AlignTop)
         self.send_btn.setStyleSheet(self.send_btn.styleSheet() + f"""
             QPushButton {{ color: {s.css(s.accent)}; }}
         """)
@@ -1653,8 +1662,14 @@ class ChatInput(QWidget):
         return super().eventFilter(obj, event)
 
     def _autosize(self) -> None:
-        height = int(min(self._max_h,
-                         max(self._min_h, self.edit.document().size().height() + 12)))
+        # QPlainTextEdit's document layout reports its height in *lines*, not
+        # pixels. The old code added 12 to a line count and called it a height,
+        # so the box effectively never grew -- six lines still measured 18.
+        doc = self.edit.document()
+        lines = doc.documentLayout().documentSize().height()
+        line_px = QFontMetrics(self.edit.font()).lineSpacing()
+        wanted = int(max(1.0, lines) * line_px) + self._pad
+        height = int(min(self._max_h, max(self._min_h, wanted)))
         if height != self.edit.height():
             self.edit.setFixedHeight(height)
 
