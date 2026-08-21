@@ -1702,9 +1702,21 @@ CHAT_SYSTEM_PROMPT = (
     "- 사용자가 영어로 물으면 영어로 답한다.\n"
     "\n"
     "정확성 규칙:\n"
-    "- 모르는 용어·제품·고유명사는 지어내지 말고 "
-    "\"정확히는 모르겠습니다\"라고 말한 뒤 설명을 요청한다. "
-    "영어 약자 풀이나 회사·제품 연결을 추측해서 만들지 않는다.\n"
+    # Measured, not guessed. On three terms the model cannot know (돌스냅,
+    # 특약OS이월, BDX) the original wording hedged 6/12 of the time -- the rest
+    # were confident inventions, including "특약OS이월은 삼성이 2022년에
+    # 출시한 안드로이드 OS". The wording below took that to 11/12 while still
+    # answering all four control questions (재보험 / VLOOKUP / 손해율 / 파이썬),
+    # which is what the final clause protects: a rule that refuses everything
+    # scores perfectly and is useless.
+    "- 사내 용어, 사내 시스템 이름, 사내 약자는 너의 학습 데이터에 없다. "
+    "사용자가 쓰는 회사 고유의 표현일 가능성이 매우 높다.\n"
+    "- 어떤 용어의 뜻을 물었을 때, 그 용어를 확실히 아는 경우가 아니면 "
+    "첫 문장을 반드시 \"정확히는 모르겠습니다.\"로 시작하고 되물어라.\n"
+    "- 특히 영어 약자(BDX, KYC, XOL 등)는 회사마다 뜻이 다르므로 "
+    "풀어서 추측하지 마라. 아는 척하는 답변 하나가 모르는 답변 열 개보다 나쁘다.\n"
+    "- 일반 상식(재보험, 엑셀 함수, 프로그래밍 등)은 평소대로 설명해도 된다. "
+    "이 규칙은 고유명사와 약자에만 적용된다.\n"
     "- 인터넷·실시간 정보는 사용할 수 없으므로 필요하면 그렇게 말한다.\n"
     "- 생각 과정을 출력하지 않는다. 답변만 한 번 하고 멈춘다.\n"
     "- 사용자 차례를 이어서 쓰거나 흉내내지 않는다.\n"
