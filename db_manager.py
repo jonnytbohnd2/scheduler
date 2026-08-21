@@ -45,6 +45,7 @@ from __future__ import annotations
 import calendar
 import logging
 import os
+import shutil
 import re
 import sqlite3
 import threading
@@ -108,6 +109,8 @@ class Schedule:
     nag_count: int = 0
     #: The occurrence that was missed (recurring rows have moved on since).
     nag_origin: Optional[datetime] = None
+    #: The occurrence whose alarm most recently fired, unacknowledged so far.
+    last_fired: Optional[datetime] = None
 
     @property
     def missed_time(self) -> datetime:
@@ -150,6 +153,8 @@ class Schedule:
             nag_count=int((row["nag_count"] if "nag_count" in row.keys() else 0) or 0),
             nag_origin=(parse_time(row["nag_origin"])
                         if "nag_origin" in row.keys() else None),
+            last_fired=(parse_time(row["last_fired"])
+                        if "last_fired" in row.keys() else None),
         )
 
 
@@ -410,6 +415,9 @@ CREATE TABLE IF NOT EXISTS schedules (
     -- nudge again; NULL means nothing pending (acknowledged, or nagged out).
     nag_at        TEXT,
     nag_count     INTEGER NOT NULL DEFAULT 0,
+    -- The occurrence whose alarm most recently fired. Firing already advances
+    -- a recurring row, so ticking that alarm off must not advance it again.
+    last_fired    TEXT,
     -- The occurrence that was actually missed. A recurring row has already
     -- rolled forward by nag time, so without this the nudge would show the
     -- *next* due date instead of the one the user walked past.
@@ -621,7 +629,7 @@ class DatabaseManager:
         """Partial update. Only known columns are accepted (SQL-injection safe)."""
         allowed = {
             "title", "target_time", "repeat_type",
-            "repeat_detail", "notified", "is_done",
+            "repeat_detail", "notified", "is_done", "last_fired",
         }
         sets, values = [], []
         for key, value in fields.items():
@@ -780,6 +788,21 @@ class DatabaseManager:
             self._log_completion(schedule, now)
             return "done", None
 
+        # The alarm for this cycle already fired, which advanced the row. The
+        # user is ticking off *that* occurrence, so the row is already where it
+        # should be -- advancing again would silently eat a whole cycle.
+        # (Reported: 8/12 alarm fired -> row moved to 9/12 -> pressing 완료 on
+        #  the card jumped it to 10/12 and September was never scheduled.)
+        fired = schedule.last_fired
+        if fired is not None and fired < schedule.target_time and now < schedule.target_time:
+            self.update_schedule(schedule_id, last_fired=None, notified=0)
+            self.clear_nag(schedule_id)
+            self._log_completion(schedule, now, due_at=fired)
+            log.info("Schedule #%d %r: acknowledged the %s alarm; next stays %s",
+                     schedule_id, schedule.title, fmt_time(fired),
+                     fmt_time(schedule.target_time))
+            return "acknowledged", schedule.target_time
+
         # Anchor at the later of "now" and the current slot. Ticking a chore off
         # early ("이번 달 것 미리 했다") must still advance a full cycle -- with a
         # plain `now` anchor the next trigger would resolve back to the slot the
@@ -791,7 +814,8 @@ class DatabaseManager:
             self.set_done(schedule_id, True)
             return "done", None
 
-        self.update_schedule(schedule_id, target_time=fmt_time(nxt), notified=0, is_done=0)
+        self.update_schedule(schedule_id, target_time=fmt_time(nxt), notified=0,
+                             is_done=0, last_fired=None)
         self._log_completion(schedule, now)
         log.info("Schedule #%d %r completed -> next cycle %s",
                  schedule_id, schedule.title, fmt_time(nxt))
@@ -800,8 +824,14 @@ class DatabaseManager:
     # ------------------------------------------------------------------ #
     # work log
     # ------------------------------------------------------------------ #
-    def _log_completion(self, schedule: Schedule, when: datetime) -> None:
-        """Record that a piece of work actually got done."""
+    def _log_completion(self, schedule: Schedule, when: datetime,
+                        due_at: Optional[datetime] = None) -> None:
+        """Record that a piece of work actually got done.
+
+        `due_at` overrides the row's current slot: after an alarm has rolled a
+        recurring row on, the occurrence that was completed is the one that
+        fired, not the one the row now points at.
+        """
         try:
             with self._lock:
                 self._sched().execute(
@@ -809,7 +839,8 @@ class DatabaseManager:
                     "(schedule_id, title, completed_at, due_at, repeat_type) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (int(schedule.id), schedule.title, fmt_time(when),
-                     fmt_time(schedule.target_time), schedule.repeat_type))
+                     fmt_time(due_at or schedule.target_time),
+                     schedule.repeat_type))
         except sqlite3.Error:
             # The tick itself already succeeded; losing a log row must not
             # turn into a failed completion.
@@ -889,6 +920,129 @@ class DatabaseManager:
         with self._lock:
             self._sched().execute("DELETE FROM schedules WHERE id = ?", (int(schedule_id),))
 
+    def list_backups(self, directory: Optional[str] = None) -> list[dict[str, Any]]:
+        """Available snapshots, newest first, with row counts.
+
+        The counts matter: after the incident that prompted this, the useful
+        question was not "which backups exist" but "which one still has my
+        일정 in it". A folder listing cannot answer that; opening each snapshot
+        read-only can.
+        """
+        root = directory or os.path.join(self.base_dir, "backups")
+        if not os.path.isdir(root):
+            return []
+        out: list[dict[str, Any]] = []
+        for name in sorted(os.listdir(root), reverse=True):
+            folder = os.path.join(root, name)
+            snapshot = os.path.join(folder, "schedules.db")
+            if not os.path.isfile(snapshot):
+                continue
+            entry = {"name": name, "path": folder, "schedules": None,
+                     "messages": None,
+                     "size": os.path.getsize(snapshot),
+                     "when": datetime.fromtimestamp(os.path.getmtime(snapshot))}
+            try:
+                conn = sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True)
+                try:
+                    entry["schedules"] = conn.execute(
+                        "SELECT COUNT(*) FROM schedules").fetchone()[0]
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                pass
+            chat = os.path.join(folder, "chat_history.db")
+            if os.path.isfile(chat):
+                try:
+                    conn = sqlite3.connect(f"file:{chat}?mode=ro", uri=True)
+                    try:
+                        entry["messages"] = conn.execute(
+                            "SELECT COUNT(*) FROM chat_messages").fetchone()[0]
+                    finally:
+                        conn.close()
+                except sqlite3.Error:
+                    pass
+            out.append(entry)
+        return out
+
+    def restore_from(self, folder: str, include_chat: bool = True) -> list[str]:
+        """Replace the live databases with a snapshot. Returns what was restored.
+
+        The current files are copied aside first, into ``backups/replaced-<ts>``:
+        a restore is itself destructive, and the thing being overwritten might
+        turn out to have been the good copy.
+
+        Callers must close every other connection first -- see
+        :meth:`DatabaseManager.close`.
+        """
+        names = ["schedules.db"] + (["chat_history.db"] if include_chat else [])
+        available = [n for n in names if os.path.isfile(os.path.join(folder, n))]
+        if not available:
+            raise FileNotFoundError(f"백업에 DB 파일이 없습니다: {folder}")
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        aside = os.path.join(self.base_dir, "backups", f"replaced-{stamp}")
+        os.makedirs(aside, exist_ok=True)
+
+        self.close()
+        restored: list[str] = []
+        for name in available:
+            live = os.path.join(self.base_dir, name)
+            if os.path.isfile(live):
+                shutil.copy2(live, os.path.join(aside, name))
+            # A stale -wal/-shm belongs to the file being replaced. SQLite
+            # copes, but leaving them is asking for a confusing recovery.
+            for suffix in ("-wal", "-shm"):
+                stale = live + suffix
+                if os.path.isfile(stale):
+                    try:
+                        os.replace(stale, os.path.join(aside, name + suffix))
+                    except OSError:
+                        pass
+            shutil.copy2(os.path.join(folder, name), live)
+            restored.append(name)
+        log.info("Restored %s from %s (previous copies in %s)",
+                 ", ".join(restored), folder, aside)
+        return restored
+
+    def sweep_completed(self, older_than_hours: int = 24,
+                        now: Optional[datetime] = None) -> int:
+        """Retire one-shot items finished more than `older_than_hours` ago.
+
+        A ticked-off item is worth seeing for the rest of the day -- it is the
+        proof you did it -- but a list that only grows stops being glanceable.
+        The completion log keeps the record either way, so the weekly report is
+        unaffected by this.
+        """
+        now = now or datetime.now()
+        cutoff = now - timedelta(hours=max(1, int(older_than_hours)))
+        with self._lock:
+            rows = self._sched().execute(
+                "SELECT id, title FROM schedules "
+                "WHERE is_done = 1 AND repeat_type = 'none'").fetchall()
+        stale: list[int] = []
+        for row in rows:
+            done_at = self._completed_at(int(row["id"]))
+            if done_at is not None and done_at < cutoff:
+                stale.append(int(row["id"]))
+        if not stale:
+            return 0
+        with self._lock:
+            self._sched().execute(
+                f"DELETE FROM schedules WHERE id IN "
+                f"({','.join('?' * len(stale))})", stale)
+        log.info("Swept %d completed item(s) older than %dh", len(stale),
+                 older_than_hours)
+        return len(stale)
+
+    def _completed_at(self, schedule_id: int) -> Optional[datetime]:
+        """When this row was last ticked off, from the work log."""
+        with self._lock:
+            row = self._sched().execute(
+                "SELECT completed_at FROM completions WHERE schedule_id = ? "
+                "ORDER BY completed_at DESC, id DESC LIMIT 1",
+                (int(schedule_id),)).fetchone()
+        return parse_time(row["completed_at"]) if row else None
+
     def clear_completed(self) -> int:
         """Delete every finished, non-recurring item. Returns rows removed."""
         with self._lock:
@@ -925,7 +1079,11 @@ class DatabaseManager:
             self.mark_notified(schedule.id, 1)
             return None
 
-        self.update_schedule(schedule.id, target_time=fmt_time(nxt), notified=0)
+        # Remember which occurrence this was. Completing an alarm you just
+        # received must not advance the row a second time -- the firing has
+        # already moved it on, and a second hop silently eats a whole cycle.
+        self.update_schedule(schedule.id, target_time=fmt_time(nxt), notified=0,
+                             last_fired=fmt_time(schedule.target_time))
         log.info("Schedule #%d rolled forward to %s", schedule.id, fmt_time(nxt))
         return nxt
 
@@ -1435,6 +1593,77 @@ def _selftest() -> None:  # pragma: no cover - manual smoke test
             db.completions_between(mon, mon + timedelta(days=5))] == ["월간 요율표 갱신"]
     db.delete_schedule(one_off)
     db.delete_schedule(chore)
+
+    # --- an alarm you tick off must not eat a whole cycle -------------------- #
+    # Reported from real use: 매월 12일 특약OS이월. The 8/12 alarm fired, which
+    # rolled the row to 9/12; pressing 완료 on that card rolled it again to
+    # 10/12 and September was never scheduled.
+    ack_now = datetime(2026, 8, 21, 10, 0)
+    fired = db.add_schedule("특약OS이월", datetime(2026, 8, 12, 9, 0), "monthly", "12")
+    db.roll_forward(db.get_schedule(fired), ack_now)
+    assert db.get_schedule(fired).target_time == datetime(2026, 9, 12, 9, 0)
+    action, nxt = db.complete_schedule(fired, now=ack_now)
+    assert action == "acknowledged", action
+    assert nxt == datetime(2026, 9, 12, 9, 0), nxt
+    assert db.get_schedule(fired).target_time == datetime(2026, 9, 12, 9, 0), "9월을 건너뜀"
+    logged = db.completions_between(datetime(2026, 8, 1), datetime(2026, 9, 1))
+    assert any(r["due_at"] == datetime(2026, 8, 12, 9, 0) for r in logged), logged
+    # A second tick is a genuine early completion and does advance.
+    assert db.complete_schedule(fired, now=ack_now)[1] == datetime(2026, 10, 12, 9, 0)
+    # ...and completing without an alarm behaves as before.
+    plain = db.add_schedule("월간 정산", datetime(2026, 8, 12, 9, 0), "monthly", "12")
+    assert db.complete_schedule(plain, now=ack_now)[1] == datetime(2026, 9, 12, 9, 0)
+    early = db.add_schedule("미리 처리", datetime(2026, 9, 12, 9, 0), "monthly", "12")
+    assert db.complete_schedule(early, now=ack_now)[1] == datetime(2026, 10, 12, 9, 0)
+    for sid in (fired, plain, early):
+        db.delete_schedule(sid)
+
+    # --- restoring from a backup --------------------------------------------- #
+    # Prompted by a real recovery: the live schedules.db had been replaced by
+    # an empty one and the only good copy was a snapshot in backups/. Hand
+    # copying database files is not something a user should have to do.
+    db.add_schedule("복원 대상", datetime(2026, 8, 20, 9, 0))
+    snap = db.backup_to(os.path.join(tmp, "backups"), keep=10)
+    listing = db.list_backups(os.path.join(tmp, "backups"))
+    assert listing, "백업 목록이 비어 있음"
+    newest = listing[0]
+    assert newest["schedules"] and newest["schedules"] > 0, newest
+    assert newest["messages"] is not None, newest
+
+    db.delete_schedule([s for s in db.list_schedules(include_done=True)
+                        if s.title == "복원 대상"][0].id)
+    assert not any(s.title == "복원 대상" for s in db.list_schedules(include_done=True))
+    restored_names = db.restore_from(snap)
+    assert "schedules.db" in restored_names, restored_names
+    reopened = DatabaseManager(tmp)
+    assert any(s.title == "복원 대상"
+               for s in reopened.list_schedules(include_done=True)), "복원 실패"
+    # the copy that was overwritten is kept, in case the restore was a mistake
+    replaced = [d for d in os.listdir(os.path.join(tmp, "backups"))
+                if d.startswith("replaced-")]
+    assert replaced, "덮어쓴 원본을 보관하지 않음"
+    reopened.close()
+    db = DatabaseManager(tmp)                    # our own handle was closed
+
+    # --- completed one-shots retire after a day ------------------------------ #
+    sweep_now = datetime(2026, 8, 21, 18, 0)
+    old = db.add_schedule("어제 끝낸 일", datetime(2026, 8, 19, 9, 0))
+    db.complete_schedule(old, now=datetime(2026, 8, 20, 9, 0))     # 33h ago
+    recent = db.add_schedule("아까 끝낸 일", datetime(2026, 8, 21, 9, 0))
+    db.complete_schedule(recent, now=datetime(2026, 8, 21, 15, 0))  # 3h ago
+    keep = db.add_schedule("아직 안 한 일", datetime(2026, 8, 22, 9, 0))
+    chore = db.add_schedule("반복 업무", datetime(2026, 8, 21, 9, 0), "monthly", "21")
+    db.complete_schedule(chore, now=sweep_now)
+    assert db.sweep_completed(24, sweep_now) == 1, "하루 지난 완료 항목만 정리해야 함"
+    remaining = {s.title for s in db.list_schedules(include_done=True)}
+    assert "어제 끝낸 일" not in remaining, remaining
+    assert {"아까 끝낸 일", "아직 안 한 일", "반복 업무"} <= remaining, remaining
+    # the work log survives the sweep -- the weekly report must not lose it
+    swept_log = [r["title"] for r in
+                 db.completions_between(datetime(2026, 8, 19), datetime(2026, 8, 22))]
+    assert "어제 끝낸 일" in swept_log, swept_log
+    for sid in (recent, keep, chore):
+        db.delete_schedule(sid)
 
     # --- opening a database from an older build ----------------------------- #
     # A missing column is a crash on open, which to the user looks like their

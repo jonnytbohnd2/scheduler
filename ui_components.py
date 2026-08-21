@@ -20,12 +20,15 @@ Preview the whole kit with ``py ui_components.py``.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import struct
 import wave
 from datetime import datetime, timedelta
 from typing import Iterable, Optional
+
+log = logging.getLogger(__name__)
 
 from PySide6.QtCore import (
     QTime,
@@ -65,6 +68,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -2208,6 +2214,101 @@ class WeekdayPicker(QWidget):
             btn.blockSignals(False)
 
 
+class RestoreDialog(GlassDialog):
+    """Pick a backup to restore.
+
+    Exists because recovering from an empty database meant hand-copying
+    ``schedules.db`` out of a dated folder while the app was closed. Each
+    snapshot is listed with **how many items it actually contains**, which is
+    the only question that matters when you are trying to find the last good
+    copy.
+    """
+
+    def __init__(self, db, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent, "백업에서 복원", width=360)
+        self.db = db
+        self.restored = False
+
+        try:
+            self.snapshots = db.list_backups()
+        except Exception as exc:                          # noqa: BLE001
+            self.snapshots = []
+            log.warning("Could not list backups: %s", exc)
+
+        intro = QLabel("복원하면 현재 일정과 대화 기록이 선택한 시점으로 돌아갑니다.\n"
+                       "지금 내용은 backups/replaced-… 폴더에 따로 보관되므로,\n"
+                       "잘못 골라도 되돌릴 수 있습니다.")
+        intro.setObjectName("muted")
+        intro.setWordWrap(True)
+        self.body.addWidget(intro)
+
+        self.list = QListWidget()
+        self.list.setMinimumHeight(168)
+        for snap in self.snapshots:
+            when = snap["when"].strftime("%Y-%m-%d %H:%M")
+            counts = []
+            if snap["schedules"] is not None:
+                counts.append(f"일정 {snap['schedules']}건")
+            if snap["messages"] is not None:
+                counts.append(f"대화 {snap['messages']}건")
+            summary = " · ".join(counts) if counts else "내용 확인 불가"
+            QListWidgetItem(f"{snap['name']}   ({when})\n      {summary}", self.list)
+        if not self.snapshots:
+            QListWidgetItem("백업이 없습니다", self.list)
+            self.list.setEnabled(False)
+        else:
+            self.list.setCurrentRow(0)
+        self.body.addWidget(self.list)
+
+        self.include_chat = QCheckBox("대화 기록도 함께 복원")
+        self.include_chat.setChecked(True)
+        self.body.addWidget(self.include_chat)
+
+        self.status = QLabel("")
+        self.status.setObjectName("muted")
+        self.status.setWordWrap(True)
+        self.body.addWidget(self.status)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel = QPushButton("닫기")
+        cancel.clicked.connect(self.reject)
+        self.restore_btn = QPushButton("복원")
+        self.restore_btn.setObjectName("primary")
+        self.restore_btn.setEnabled(bool(self.snapshots))
+        self.restore_btn.clicked.connect(self._restore)
+        actions.addWidget(cancel)
+        actions.addWidget(self.restore_btn)
+        self.body.addLayout(actions)
+
+    def _restore(self) -> None:
+        row = self.list.currentRow()
+        if not (0 <= row < len(self.snapshots)):
+            return
+        snap = self.snapshots[row]
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("복원 확인")
+        confirm.setIcon(QMessageBox.Warning)
+        confirm.setText(f"{snap['name']} 시점으로 되돌립니다.")
+        confirm.setInformativeText(
+            "현재 내용은 backups 폴더에 보관됩니다.\n복원 후 앱을 다시 시작해야 합니다.")
+        confirm.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+        confirm.setDefaultButton(QMessageBox.Cancel)
+        if confirm.exec() != QMessageBox.Ok:
+            return
+        try:
+            names = self.db.restore_from(
+                snap["path"], include_chat=self.include_chat.isChecked())
+        except Exception as exc:                          # noqa: BLE001
+            log.exception("Restore failed")
+            self.status.setText(f"복원 실패: {exc}")
+            return
+        self.restored = True
+        self.status.setText(f"복원 완료: {', '.join(names)} — 앱을 다시 시작해주세요.")
+        self.restore_btn.setEnabled(False)
+        self.list.setEnabled(False)
+
+
 class WorkReportDialog(GlassDialog):
     """"이번 주 한 일" -- the paragraph everyone has to write on Friday.
 
@@ -2330,6 +2431,16 @@ class ManualScheduleDialog(GlassDialog):
 
         quick = QHBoxLayout()
         quick.setSpacing(3)
+        # "지금" first, because the offsets are relative to whatever is in the
+        # box: resetting to now and then stepping is how you re-time an item
+        # that has drifted, and without it every nudge compounds an old value.
+        now_btn = QPushButton("지금")
+        now_btn.setObjectName("ghost")
+        now_btn.setToolTip("현재 시각으로 맞춥니다 (분 단위 반올림)")
+        now_btn.setCursor(Qt.PointingHandCursor)
+        now_btn.setFixedHeight(max(18, s.ctl_h - 6))
+        now_btn.clicked.connect(self._set_now)
+        quick.addWidget(now_btn)
         for label, delta in (("+10분", timedelta(minutes=10)), ("+1시간", timedelta(hours=1)),
                              ("내일", timedelta(days=1)), ("다음주", timedelta(days=7))):
             btn = QPushButton(label)
@@ -2391,6 +2502,11 @@ class ManualScheduleDialog(GlassDialog):
     def _nudge(self, delta: timedelta) -> None:
         current = self.when_edit.dateTime().toPython()
         self.when_edit.setDateTime(current + delta)
+
+    def _set_now(self) -> None:
+        """Snap to the current minute, so the offsets have a clean base."""
+        self.when_edit.setDateTime(
+            datetime.now().replace(second=0, microsecond=0))
 
     def _sync_detail(self, *_args) -> None:
         repeat = self.repeat_box.currentData()
@@ -2561,6 +2677,7 @@ class SettingsDialog(GlassDialog):
 
     preview_requested = Signal()        # config changed -> restyle now
     reset_requested = Signal()
+    restore_requested = Signal()        # 정보 탭 -> 백업에서 복원…
 
     def __init__(self, config: Config, parent: Optional[QWidget] = None,
                  backend: Optional[dict] = None, db: object = None) -> None:
@@ -2856,6 +2973,14 @@ class SettingsDialog(GlassDialog):
         layout.addWidget(self._row("확인 주기", self._spin(
             1, 60, b["poll_seconds"], "초",
             lambda v: self._apply("behavior", "poll_seconds", v))))
+        layout.addWidget(self._row("완료 항목 자동 정리", self._spin(
+            0, 720, b["sweep_completed_hours"], "시간 뒤",
+            lambda v: self._apply("behavior", "sweep_completed_hours", v))))
+        sweep_hint = QLabel("완료 표시한 1회성 일정을 목록에서 치웁니다. 0이면 끄기.\n"
+                            "업무 보고용 완료 기록은 그대로 남습니다.")
+        sweep_hint.setObjectName("muted")
+        sweep_hint.setWordWrap(True)
+        layout.addWidget(sweep_hint)
         layout.addWidget(self._check("완료된 일정 숨기기", b["hide_completed"],
                                      lambda v: self._apply("behavior", "hide_completed", v)))
         layout.addWidget(self._check("삭제 전 확인", b["confirm_delete"],
@@ -3030,7 +3155,7 @@ class SettingsDialog(GlassDialog):
         row = QHBoxLayout()
         row.setSpacing(4)
         for label, target in (("사용 설명서", "USER_MANUAL.md"), ("폴더 열기", "."),
-                              ("로그 열기", "logs")):
+                              ("로그 열기", "logs"), ("백업에서 복원…", "@restore")):
             btn = QPushButton(label)
             btn.clicked.connect(lambda _=False, t=target: self._open_path(t))
             row.addWidget(btn)
@@ -3091,6 +3216,9 @@ class SettingsDialog(GlassDialog):
         self.preview_requested.emit()
 
     def _open_path(self, relative: str) -> None:
+        if relative == "@restore":
+            self.restore_requested.emit()
+            return
         target = os.path.join(self.config.base_dir, relative)
         try:
             if not os.path.exists(target):

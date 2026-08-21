@@ -109,6 +109,7 @@ from ui_components import (
     NotificationSound,
     QuickAddBar,
     ScheduleFilterBar,
+    RestoreDialog,
     ScheduleListView,
     SettingsDialog,
     TitleBar,
@@ -405,6 +406,15 @@ class HudWindow(QWidget):
         if not self.scheduler.start():
             self.toast.show_text("알람 스케줄러를 시작하지 못했습니다 (로그 확인)", "error", 8000)
 
+        # Retire yesterday's ticked-off items so the list stays glanceable.
+        # Hourly rather than on every refresh: it is housekeeping, not
+        # something the user should watch happen mid-interaction.
+        self._sweep_timer = QTimer(self)
+        self._sweep_timer.setInterval(60 * 60 * 1000)
+        self._sweep_timer.timeout.connect(self._sweep_completed)
+        self._sweep_timer.start()
+        QTimer.singleShot(4000, self._sweep_completed)
+
         preload = bool(self.config.llm["preload"])
         self.llm.start(preload=False)                 # spin the thread only
         if preload:
@@ -486,6 +496,7 @@ class HudWindow(QWidget):
         dialog = SettingsDialog(self.config, self, backend=backend_info(), db=self.db)
         dialog.preview_requested.connect(lambda: self.apply_settings(restyle=True))
         dialog.reset_requested.connect(self._reset_settings)
+        dialog.restore_requested.connect(lambda: self.open_restore(dialog))
         dialog.center_on(self)
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         if not accepted:
@@ -854,9 +865,11 @@ class HudWindow(QWidget):
         action, nxt = self.db.complete_schedule(schedule_id, done)
         self.refresh_schedules()
 
-        if action == "rolled" and nxt is not None:
+        if action in ("rolled", "acknowledged") and nxt is not None:
+            # "acknowledged" means the alarm had already advanced the row, so
+            # the next date is unchanged rather than pushed on again.
             self.toast.show_text(
-                f"{title} 완료! 다음 일정: {nxt.strftime('%m/%d %H:%M')} 이월됨",
+                f"{title} 완료! 다음 일정: {nxt.strftime('%m/%d %H:%M')}",
                 "success", 4200)
             if self.config.behavior["flash_on_alert"]:
                 self.panel.flash_alert(style().success, pulses=1, duration_ms=420)
@@ -919,6 +932,36 @@ class HudWindow(QWidget):
         self.quiet.lunch_end = _hhmm(b.get("lunch_end", "13:00"), 13, 0)
         self.quiet.skip_lunch = bool(b.get("quiet_skip_lunch", False))
         self.quiet.skip_holidays = bool(b.get("quiet_skip_holidays", True))
+
+    @guard("백업 복원")
+    def open_restore(self, parent: Optional[QWidget] = None) -> None:
+        """Restore a snapshot, then insist on a restart.
+
+        Every widget and worker is holding rows read from the old database, so
+        carrying on with the new one would show a mix of both. A restart is the
+        honest option, and the alternative (rebuilding the whole UI in place)
+        is a lot of machinery for something done once a year.
+        """
+        dialog = RestoreDialog(self.db, parent or self)
+        dialog.center_on(parent or self)
+        dialog.exec()
+        if not dialog.restored:
+            return
+        self.scheduler.stop()
+        QMessageBox.information(
+            self, "복원 완료",
+            "백업에서 복원했습니다.\n\n변경 내용을 적용하려면 앱을 종료했다가\n"
+            "다시 실행해주세요.")
+        log.info("Restore finished; quitting so the new databases are opened cleanly")
+        QApplication.quit()
+
+    @guard("완료 항목 정리", toast=False)
+    def _sweep_completed(self) -> None:
+        hours = int(self.config.behavior.get("sweep_completed_hours", 24))
+        if hours <= 0:
+            return                                   # the user turned it off
+        if self.db.sweep_completed(hours):
+            self.refresh_schedules()
 
     @guard("업무 보고 만들기")
     def open_work_report(self) -> None:
@@ -1028,9 +1071,9 @@ class HudWindow(QWidget):
         self.db.clear_nag(self._active_alarm.id)
         action, nxt = self.db.complete_schedule(self._active_alarm.id, True)
         self.refresh_schedules()
-        if action == "rolled" and nxt is not None:
+        if action in ("rolled", "acknowledged") and nxt is not None:
             self.toast.show_text(
-                f"{title} 완료! 다음 일정: {nxt.strftime('%m/%d %H:%M')} 이월됨",
+                f"{title} 완료! 다음 일정: {nxt.strftime('%m/%d %H:%M')}",
                 "success", 4200)
         else:
             self.toast.show_text(f"{title} 완료", "success")

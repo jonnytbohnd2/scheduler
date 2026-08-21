@@ -238,6 +238,10 @@ DEFAULTS: dict[str, Any] = {
         "quiet_skip_holidays": True,
         # Read-only glance at the Outlook calendar.
         "calendar_enabled": True,
+        # Retire ticked-off one-shot items after a while. Seeing what you
+        # finished today is useful; a list that only grows is not. The
+        # completion log keeps the record, so reports are unaffected.
+        "sweep_completed_hours": 24,
     },
     "llm": {
         "model_path": "",           # empty -> auto-discover in models/
@@ -536,6 +540,8 @@ class Config:
         b["quiet_skip_lunch"] = bool(b.get("quiet_skip_lunch", False))
         b["quiet_skip_holidays"] = bool(b.get("quiet_skip_holidays", True))
         b["calendar_enabled"] = bool(b.get("calendar_enabled", True))
+        b["sweep_completed_hours"] = int(
+            _clamp(b.get("sweep_completed_hours"), 0, 720, 24))
         for key, fallback in (("work_start", "09:00"), ("work_end", "18:00"),
                               ("lunch_start", "12:00"), ("lunch_end", "13:00")):
             b[key] = _clean_hhmm(b.get(key), fallback)
