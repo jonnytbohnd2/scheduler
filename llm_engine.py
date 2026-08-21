@@ -1591,8 +1591,12 @@ CHAT_SYSTEM_PROMPT = (
     "한국어로 정중하고 간결하게 답변해라.\n"
     "\n"
     "형식 규칙:\n"
-    "- 답변은 짧은 불릿 2~3개 이내로 끝낸다. 서론과 맺음말은 쓰지 않는다.\n"
-    "- 한 문장은 40자 내외로 짧게 쓴다.\n"
+    # A hard "always use bullets" rule was here to stop the 1.7B rambling. A
+    # model that follows instructions properly then answered "오늘 힘들었어"
+    # with a three-item checklist, which reads like a machine. Bullets are for
+    # lists; a remark deserves a sentence.
+    "- 나열할 항목이 둘 이상일 때만 불릿을 쓴다. 그 외에는 평범한 문장으로 답한다.\n"
+    "- 전체 3~4문장 이내로 짧게 끝낸다. 서론과 맺음말은 쓰지 않는다.\n"
     "- 사용자가 영어로 물으면 영어로 답한다.\n"
     "\n"
     "정확성 규칙:\n"
