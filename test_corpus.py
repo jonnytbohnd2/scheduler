@@ -284,6 +284,32 @@ def curated() -> list[Case]:
         ("8월 말일 정산 마감", TOOL_ADD, "정산 마감",
          f"{md(8, 31).strftime('%m/%d')} 09:00"),
 
+        # ---- a date inside brackets, and 퇴근 전까지 ------------------------ #
+        # Reported: the date was cut out of the parenthetical and the shell was
+        # kept -- "…송부 요청( (월) 전 )". Brackets holding real content must
+        # still survive.
+        ("영업계수 마감 결과 송부 요청(8/24(월) 퇴근 전까지)", TOOL_ADD,
+         "영업계수 마감 결과 송부 요청", f"{md(8, 24).strftime('%m/%d')} 18:00"),
+        ("분기보고서 제출[8/24 까지]", TOOL_ADD, "분기보고서 제출",
+         f"{md(8, 24).strftime('%m/%d')} 09:00"),
+        ("8/24 퇴근 전까지 보고서 제출", TOOL_ADD, "보고서 제출",
+         f"{md(8, 24).strftime('%m/%d')} 18:00"),
+        ("요율 검토 (긴급) 8/25 10시", TOOL_ADD, "요율 검토 (긴급)",
+         f"{md(8, 25).strftime('%m/%d')} 10:00"),
+        ("계약 검토 (김과장) 내일 3시", TOOL_ADD, "계약 검토 (김과장)",
+         f"{tomorrow} 15:00"),
+
+        # ---- pasted email must never book ---------------------------------- #
+        # A 652-character schedule was created from an email whose header said
+        # "Sent: Monday"; the reply the user asked for never happened.
+        ("ok let's move on. write me a reponse to below email saying well "
+         "received. From: Gosling, Thomas 01 <Thomas.Gosling01@marsh.com> "
+         "Sent: Monday, To: sjhuh@koreanre.co.kr Subject: RE: Korean Re / "
+         "Marsh Leading Edge Presentation Hi All Thanks once again for your "
+         "time today. Best regards, Tom", TOOL_NONE, None, None),
+        ("이 메일 답장 써줘\n보낸사람: 김영수 과장\n제목: 회의 일정 문의\n"
+         "다음 주 화요일 오후 2시에 진행하려 합니다.", TOOL_NONE, None, None),
+
         # ---- multi-item ---------------------------------------------------- #
         ("8/24 엑셀 제출 / 8/31 ppt 제출", TOOL_ADD, "엑셀 제출",
          f"{md(8, 24).strftime('%m/%d')} 09:00"),

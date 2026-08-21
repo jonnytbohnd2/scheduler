@@ -3170,7 +3170,9 @@ class SettingsDialog(GlassDialog):
         row = QHBoxLayout()
         row.setSpacing(4)
         for label, target in (("사용 설명서", "USER_MANUAL.md"), ("폴더 열기", "."),
-                              ("로그 열기", "logs"), ("백업에서 복원…", "@restore")):
+                              ("로그 열기", "logs"), ("백업에서 복원…", "@restore"),
+                              ("시스템 프롬프트 편집…", "@prompt"),
+                              ("휴일 목록 편집…", "holidays.txt")):
             btn = QPushButton(label)
             btn.clicked.connect(lambda _=False, t=target: self._open_path(t))
             row.addWidget(btn)
@@ -3233,6 +3235,14 @@ class SettingsDialog(GlassDialog):
     def _open_path(self, relative: str) -> None:
         if relative == "@restore":
             self.restore_requested.emit()
+            return
+        if relative == "@prompt":
+            # Written on first run; create it here too in case it was deleted.
+            from llm_engine import write_system_prompt_template
+            try:
+                os.startfile(write_system_prompt_template())   # noqa: S606
+            except Exception:                                  # noqa: BLE001
+                log.exception("Could not open the system prompt file")
             return
         target = os.path.join(self.config.base_dir, relative)
         try:

@@ -91,6 +91,7 @@ from llm_engine import (
     detect_tool_intent,
     find_model_path,
     is_volatile_model,
+    write_system_prompt_template,
     models_dir,
 )
 from holidays import HOLIDAYS_FILENAME, calendar as holiday_calendar
@@ -1604,6 +1605,9 @@ def main() -> int:
     # The GGUF lives in the data folder, so replacing the program folder to
     # upgrade never costs a 1 GB re-copy.
     ensure_models_dir()
+    # The chat prompt lives in the data folder so it can be reviewed and
+    # tuned without a rebuild.
+    write_system_prompt_template()
 
     crash_handler.setup_logging(data, verbose="--debug" in argv)
     crash_handler.install(data, APP_NAME)

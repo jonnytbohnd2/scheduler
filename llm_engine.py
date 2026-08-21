@@ -352,6 +352,37 @@ _COMPOSE_RE = re.compile(
 )
 
 
+#: Fragments that mean nothing once the date they qualified has been removed.
+_HOLLOW = re.compile(
+    r"^[\s,./·~\-–—:;]*"
+    r"(?:(?:월|화|수|목|금|토|일)요일|[월화수목금토일]|전|까지|부터|이전|무렵|"
+    r"쯤|경|안|내|중|마감|기한|예정|due|by|until)?"
+    r"[\s,./·~\-–—:;]*$")
+
+
+def _drop_hollow_brackets(text: str) -> str:
+    """Remove bracket groups left hollow by cutting the date out of them.
+
+    "영업계수 마감 결과 송부 요청(8/24(월) 퇴근 전까지)" kept its brackets after
+    the date was blanked, and filed itself as "…송부 요청( (월) 전 )". A group
+    holding real content -- "(긴급)", "(김과장)" -- has to survive, so only
+    groups whose remainder is punctuation or a stranded date particle go.
+    """
+    pattern = re.compile(r"([(\[（【])([^()\[\]（）【】]*)([)\]）】])")
+    for _ in range(3):                      # nested groups need a second pass
+        new = pattern.sub(
+            lambda m: "" if _HOLLOW.match(m.group(2)) else m.group(0), text)
+        if new == text:
+            break
+        text = new
+    # An opener whose partner was inside the removed span, or vice versa.
+    if text.count("(") != text.count(")"):
+        text = text.replace("(", " ").replace(")", " ")
+    if text.count("[") != text.count("]"):
+        text = text.replace("[", " ").replace("]", " ")
+    return text
+
+
 def looks_pasted(text: str) -> bool:
     """True when the text is quoted material rather than an instruction."""
     if not text:
@@ -1004,13 +1035,17 @@ class HeuristicParser:
                 return (hour, 0), 0.9, [m.span()], True, True
 
         # Vague parts of the day -- usable as a time, but never definite.
+        # The trailing 전/까지/쯤 is swallowed with the word: matching only
+        # "퇴근" out of "퇴근 전까지" left a bare "전" stranded in the title
+        # ("8/24 퇴근 전까지 보고서 제출" -> "전 보고서 제출").
+        tail = r"(?:\s*(?:전|이전|무렵|쯤|경)?\s*(?:까지|전까지|까지는|안에|내로|내)?)"
         for word, hm, conf in (
             ("자정", (0, 0), 0.8), ("정오", (12, 0), 0.8),
             ("점심때", (12, 0), 0.6), ("점심", (12, 0), 0.55),
             ("아침", (8, 0), 0.5), ("저녁때", (18, 0), 0.6), ("저녁", (18, 0), 0.55),
             ("밤", (21, 0), 0.5), ("새벽", (5, 0), 0.5), ("퇴근", (18, 0), 0.5),
         ):
-            m = re.search(word, low)
+            m = re.search(word + tail, low)
             if m:
                 definite = word in ("자정", "정오")
                 return hm, conf, [m.span()], True, definite
@@ -1029,6 +1064,7 @@ class HeuristicParser:
             base = re.sub(re.escape(word), " ", base, flags=re.IGNORECASE)
 
         def tidy(text: str) -> str:
+            text = _drop_hollow_brackets(text)
             text = re.sub(r"\b(에|에서|부터|까지|의|은|는|이|가|을|를)\b", " ", text)
             text = re.sub(r"\s+", " ", text).strip(" ,.!?~-·|")
             text = re.sub(r"(에|에서|으로|로|때)$", "", text).strip()
@@ -1666,6 +1702,66 @@ def strip_think(text: str, mode: str = "hide") -> str:
     return cleaned.strip()
 
 
+SYSTEM_PROMPT_FILENAME = "system_prompt.txt"
+_PROMPT_CACHE: dict[str, Any] = {"path": None, "mtime": None, "text": None}
+
+
+def system_prompt_path() -> str:
+    """Where the editable copy of the chat system prompt lives."""
+    return os.path.join(_DATA_DIR or app_dir(), SYSTEM_PROMPT_FILENAME)
+
+
+def write_system_prompt_template(path: Optional[str] = None) -> str:
+    """Drop the built-in prompt into the data folder so it can be edited.
+
+    Kept as a plain file rather than a settings text box: it is long, it wants
+    a real editor, and having it on disk means a bad edit can be fixed with
+    Notepad instead of by reinstalling. Deleting the file restores the default.
+    """
+    target = path or system_prompt_path()
+    if os.path.exists(target):
+        return target
+    try:
+        with open(target, "w", encoding="utf-8-sig") as handle:
+            handle.write(
+                "# AI 대화 탭의 시스템 프롬프트입니다.\n"
+                "# 이 파일을 고치면 다음 대화부터 바로 적용됩니다 (재시작 불필요).\n"
+                "# 파일을 지우면 기본값으로 돌아갑니다.\n"
+                "# '#' 로 시작하는 줄은 무시됩니다.\n"
+                "#\n"
+                "# 주의: 아래 '정확성 규칙' 은 실측으로 정해진 문구입니다.\n"
+                "#   모르는 용어를 지어내는 비율 50% -> 9% 로 줄인 조합이며,\n"
+                "#   특히 마지막 '일반 상식은 평소대로 설명해도 된다' 줄을 지우면\n"
+                "#   아는 것까지 모른다고 답하기 시작합니다.\n"
+                "\n" + CHAT_SYSTEM_PROMPT + "\n")
+    except OSError as exc:
+        log.warning("Could not write %s: %s", target, exc)
+    return target
+
+
+def load_system_prompt() -> str:
+    """The active prompt: the user's file if present, else the built-in one."""
+    path = system_prompt_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return CHAT_SYSTEM_PROMPT
+    if _PROMPT_CACHE["path"] == path and _PROMPT_CACHE["mtime"] == mtime:
+        return _PROMPT_CACHE["text"] or CHAT_SYSTEM_PROMPT
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            body = "\n".join(line for line in handle.read().splitlines()
+                             if not line.lstrip().startswith("#")).strip()
+    except OSError as exc:
+        log.warning("Could not read %s: %s", path, exc)
+        return CHAT_SYSTEM_PROMPT
+    if len(body) < 20:          # emptied by accident -- fall back, do not ship a blank
+        log.warning("%s is empty; using the built-in prompt", path)
+        body = CHAT_SYSTEM_PROMPT
+    _PROMPT_CACHE.update(path=path, mtime=mtime, text=body)
+    return body
+
+
 NO_THINK = "/no_think"
 
 #: ChatML terminators. Qwen's GGUF chat template wraps every turn in
@@ -2049,7 +2145,9 @@ class LlmWorker(QObject):
                 return
 
             think_mode = str(self._opt("thinking", "hide"))
-            payload = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+            # Re-read each turn: editing system_prompt.txt takes effect
+            # on the next message, with no restart.
+            payload = [{"role": "system", "content": load_system_prompt()}]
             payload += [dict(m) for m in (messages or [])]
             if think_mode == "off" and payload:
                 # Qwen3 reads /no_think from the latest user turn.
