@@ -2976,6 +2976,31 @@ class SettingsDialog(GlassDialog):
         layout.addWidget(self._check(
             "Outlook 오늘 일정 표시", b["calendar_enabled"],
             lambda v: self._apply("behavior", "calendar_enabled", v)))
+        layout.addWidget(self._check(
+            "받은 메일 보관 (답장 초안용, 최근 10개)", b["keep_recent_mails"],
+            lambda v: self._apply("behavior", "keep_recent_mails", v)))
+        names = QLineEdit(b["my_names"])
+        names.setPlaceholderText("Jon, 허성진, sjhuh")
+        names.setFixedHeight(style().ctl_h)
+        names.textChanged.connect(
+            lambda v: None if self._loading else self._apply("behavior", "my_names", v))
+        layout.addWidget(self._row("내 이름/호칭", names))
+        names_hint = QLabel(
+            "메일 첫인사에서 이 이름을 부르면 ‘나에게 온 메일’로 표시합니다.\n"
+            "예: “Dear Jon,” · “허성진 님께”. 쉼표로 여러 개.")
+        names_hint.setObjectName("muted")
+        names_hint.setWordWrap(True)
+        layout.addWidget(names_hint)
+        layout.addWidget(self._check(
+            "수신인(To/Cc)도 확인  ⚠ 보안 경고가 뜨면 끄세요", b["read_recipients"],
+            lambda v: self._apply("behavior", "read_recipients", v)))
+        recip_hint = QLabel(
+            "Outlook이 수신인 정보 접근에 경고창을 띄울 수 있어 기본은 꺼짐입니다.\n"
+            "켜고 메일을 받아본 뒤, 경고가 없으면 그대로 두시면 됩니다.\n"
+            "꺼져 있어도 첫인사로 판별하므로 대부분 문제없습니다.")
+        recip_hint.setObjectName("muted")
+        recip_hint.setWordWrap(True)
+        layout.addWidget(recip_hint)
 
         quiet_hint = QLabel(
             "근무 시간 밖의 알림은 사라지지 않고 다음 근무 시간에 울립니다.\n"

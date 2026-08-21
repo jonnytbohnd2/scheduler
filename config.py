@@ -238,6 +238,15 @@ DEFAULTS: dict[str, Any] = {
         "quiet_skip_holidays": True,
         # Read-only glance at the Outlook calendar.
         "calendar_enabled": True,
+        # Keep matched mails so a reply can be drafted from them.
+        "keep_recent_mails": True,
+        # Names a mail might greet you by: "Dear Jon," / "허성진 님께".
+        "my_names": "",
+        # Read To/Cc to tell direct mail from a Cc. Off by default:
+        # recipient fields are behind the same Outlook guard that made
+        # sender lookups pop a dialog, so the user turns it on, checks,
+        # and leaves it on only if their machine stays quiet.
+        "read_recipients": False,
         # Retire ticked-off one-shot items after a while. Seeing what you
         # finished today is useful; a list that only grows is not. The
         # completion log keeps the record, so reports are unaffected.
@@ -540,6 +549,9 @@ class Config:
         b["quiet_skip_lunch"] = bool(b.get("quiet_skip_lunch", False))
         b["quiet_skip_holidays"] = bool(b.get("quiet_skip_holidays", True))
         b["calendar_enabled"] = bool(b.get("calendar_enabled", True))
+        b["keep_recent_mails"] = bool(b.get("keep_recent_mails", True))
+        b["read_recipients"] = bool(b.get("read_recipients", False))
+        b["my_names"] = str(b.get("my_names", "") or "").strip()[:120]
         b["sweep_completed_hours"] = int(
             _clamp(b.get("sweep_completed_hours"), 0, 720, 24))
         for key, fallback in (("work_start", "09:00"), ("work_end", "18:00"),

@@ -453,6 +453,23 @@ CREATE TABLE IF NOT EXISTS completions (
 );
 CREATE INDEX IF NOT EXISTS idx_completions_when
     ON completions (completed_at);
+
+-- The last few mails that matched a watch rule, kept so the chat tab can draft
+-- a reply to one. Only rules the user set up are captured -- the whole inbox is
+-- neither needed nor ours to hoard. Pruned to RECENT_MAIL_KEEP rows.
+CREATE TABLE IF NOT EXISTS recent_mails (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id     TEXT UNIQUE,                   -- Outlook's own id, for dedupe
+    subject      TEXT    NOT NULL DEFAULT '',
+    body         TEXT    NOT NULL DEFAULT '',
+    sender       TEXT    NOT NULL DEFAULT '',
+    received_at  TEXT,
+    addressed    INTEGER NOT NULL DEFAULT 0,    -- 1 = greeting names the user
+    rule_id      INTEGER,
+    saved_at     TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_recent_mails_when
+    ON recent_mails (received_at DESC);
 """
 
 def _columns_of(schema: str, table: str) -> list[tuple[str, str]]:
@@ -919,6 +936,77 @@ class DatabaseManager:
     def delete_schedule(self, schedule_id: int) -> None:
         with self._lock:
             self._sched().execute("DELETE FROM schedules WHERE id = ?", (int(schedule_id),))
+
+    # ------------------------------------------------------------------ #
+    # recent mail (for "이거 답장 써줘")
+    # ------------------------------------------------------------------ #
+    #: Enough to find the one you mean, few enough that the table stays small.
+    RECENT_MAIL_KEEP = 10
+    #: Bodies are quoted back to the model; a whole thread would blow the
+    #: context window on a 4B and cost minutes of generation.
+    MAIL_BODY_CHARS = 4000
+
+    def save_recent_mail(self, entry_id: str, subject: str, body: str,
+                         sender: str = "", received_at: Optional[datetime] = None,
+                         addressed: bool = False,
+                         rule_id: Optional[int] = None) -> Optional[int]:
+        """Keep a matched mail so a reply can be drafted from it later."""
+        try:
+            with self._lock:
+                cur = self._sched().execute(
+                    "INSERT OR REPLACE INTO recent_mails "
+                    "(entry_id, subject, body, sender, received_at, addressed, "
+                    " rule_id, saved_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (entry_id or None, (subject or "").strip(),
+                     (body or "")[:self.MAIL_BODY_CHARS], (sender or "").strip(),
+                     fmt_time(received_at) if received_at else None,
+                     1 if addressed else 0,
+                     int(rule_id) if rule_id else None,
+                     fmt_time(datetime.now())))
+                new_id = int(cur.lastrowid)
+                self._sched().execute(
+                    "DELETE FROM recent_mails WHERE id NOT IN "
+                    "(SELECT id FROM recent_mails "
+                    " ORDER BY COALESCE(received_at, saved_at) DESC LIMIT ?)",
+                    (self.RECENT_MAIL_KEEP,))
+            return new_id
+        except sqlite3.Error:
+            log.exception("Could not store mail %r", subject[:40])
+            return None
+
+    def recent_mails(self, limit: int = 10,
+                     addressed_only: bool = False) -> list[dict[str, Any]]:
+        """Newest first."""
+        clause = "WHERE addressed = 1 " if addressed_only else ""
+        with self._lock:
+            rows = self._sched().execute(
+                f"SELECT id, entry_id, subject, body, sender, received_at, "
+                f"addressed FROM recent_mails {clause}"
+                f"ORDER BY COALESCE(received_at, saved_at) DESC LIMIT ?",
+                (max(1, int(limit)),)).fetchall()
+        return [{"id": r["id"], "entry_id": r["entry_id"], "subject": r["subject"],
+                 "body": r["body"], "sender": r["sender"],
+                 "received_at": parse_time(r["received_at"]) if r["received_at"] else None,
+                 "addressed": bool(r["addressed"])} for r in rows]
+
+    def find_recent_mail(self, query: str) -> Optional[dict[str, Any]]:
+        """The best match for a subject fragment; newest wins on a tie."""
+        needle = (query or "").strip().lower()
+        mails = self.recent_mails(self.RECENT_MAIL_KEEP)
+        if not needle:
+            return mails[0] if mails else None
+        for mail in mails:                        # substring, newest first
+            if needle in (mail["subject"] or "").lower():
+                return mail
+        # Fall back to word overlap, so "요율 검토" finds "RE: 3분기 요율 검토 회의".
+        words = [w for w in re.split(r"\s+", needle) if len(w) > 1]
+        best, best_score = None, 0
+        for mail in mails:
+            subject = (mail["subject"] or "").lower()
+            score = sum(1 for w in words if w in subject)
+            if score > best_score:
+                best, best_score = mail, score
+        return best
 
     def list_backups(self, directory: Optional[str] = None) -> list[dict[str, Any]]:
         """Available snapshots, newest first, with row counts.

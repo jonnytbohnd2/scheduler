@@ -79,17 +79,23 @@ from llm_engine import (
     TOOL_DELETE_EMAIL,
     TOOL_LIST,
     TOOL_LIST_EMAIL,
+    TOOL_LIST_MAIL,
+    TOOL_REPLY_MAIL,
     TOOL_REPORT,
     LlmController,
     ParseResult,
     ToolIntent,
     app_dir,
     backend_info,
+    REPLY_MAX_TOKENS,
+    REPLY_SYSTEM_PROMPT,
     build_chat_context,
+    build_reply_prompt,
     correct_false_action_claim,
     ensure_models_dir,
     detect_tool_intent,
     find_model_path,
+    looks_pasted,
     is_volatile_model,
     write_system_prompt_template,
     models_dir,
@@ -169,7 +175,10 @@ class HudWindow(QWidget):
             quiet=self.quiet)
         self.outlook = OutlookMonitorController(
             db, interval_seconds=int(config.behavior.get("outlook_poll_seconds", 10)),
-            calendar_enabled=bool(config.behavior.get("calendar_enabled", True)))
+            calendar_enabled=bool(config.behavior.get("calendar_enabled", True)),
+            keep_mails=bool(config.behavior.get("keep_recent_mails", True)),
+            my_names=str(config.behavior.get("my_names", "")),
+            read_recipients=bool(config.behavior.get("read_recipients", False)))
 
         self._build_window()
         self._build_ui()
@@ -484,6 +493,10 @@ class HudWindow(QWidget):
         self._sync_quiet_hours()
         self.outlook.set_calendar_enabled(
             bool(cfg.behavior.get("calendar_enabled", True)))
+        self.outlook.set_mail_options(
+            bool(cfg.behavior.get("keep_recent_mails", True)),
+            str(cfg.behavior.get("my_names", "")),
+            bool(cfg.behavior.get("read_recipients", False)))
         self.scheduler.nag_minutes = max(1, int(cfg.behavior.get("nag_minutes", 10)))
         self.scheduler.nag_max = max(1, int(cfg.behavior.get("nag_max_count", 3)))
         self.llm.apply_options(dict(cfg.llm))
@@ -1197,6 +1210,8 @@ class HudWindow(QWidget):
             TOOL_LIST_EMAIL: self._tool_list_email,
             TOOL_DELETE_EMAIL: self._tool_delete_email,
             TOOL_REPORT: self._tool_report,
+            TOOL_LIST_MAIL: self._tool_list_mail,
+            TOOL_REPLY_MAIL: self._tool_reply_mail,
         }
         handler = handlers.get(intent.tool)
         if handler is None:
@@ -1229,6 +1244,75 @@ class HudWindow(QWidget):
         self.toast.show_text(f"일정 {len(items)}건 등록됨", "success")
         body = "\n".join(f"{i}. {line}" for i, line in enumerate(lines, 1))
         return f"✅ 일정 {len(items)}건 등록 완료:\n{body}"
+
+    def _send_to_model(self, user_text: str,
+                       system: Optional[str] = None) -> None:
+        """Ask the model a one-off question, outside the conversation history.
+
+        Used for a reply draft: the mail body would otherwise be replayed as
+        context on every later turn, which on a 4B costs minutes and drifts the
+        conversation back onto an email nobody is discussing any more.
+        """
+        if not self.llm.can_chat:
+            notice = "AI 모델을 사용할 수 없어 초안 작성은 어렵습니다. (설정 → AI)"
+            self.chat_view.add_message("ai", notice)
+            self.db.add_message("ai", notice)
+            self.chat_input.set_generating(False)
+            return
+        payload = [{"role": "user", "content": user_text}]
+        self.chat_view.start_stream()
+        self.chat_input.set_generating(True)
+        self._chat_db_row = self.db.add_message("ai", "")
+        self._chat_request_id = self.llm.send_chat(
+            payload, system=system or REPLY_SYSTEM_PROMPT,
+            max_tokens=REPLY_MAX_TOKENS)
+
+    def _tool_list_mail(self, intent: ToolIntent) -> str:
+        """What is available to reply to."""
+        mails = self.db.recent_mails(10)
+        if not mails:
+            return ("보관된 메일이 없습니다.\n"
+                    "메일 감지 규칙에 걸린 메일만 보관합니다 "
+                    "(설정 → 메일 에서 규칙을 등록하세요).")
+        lines = ["▤ 최근 메일"]
+        for i, mail in enumerate(mails, 1):
+            when = mail["received_at"].strftime("%m/%d %H:%M") if mail["received_at"] else "-"
+            mark = " ★" if mail["addressed"] else ""
+            lines.append(f"{i}. {mail['subject'][:46]}{mark}   ({when})")
+        lines.append("")
+        lines.append("‘<제목 일부> 메일 답장 써줘’ 라고 하시면 초안을 씁니다."
+                     "  (★ = 본문에서 회원님을 직접 부른 메일)")
+        return "\n".join(lines)
+
+    def _tool_reply_mail(self, intent: ToolIntent) -> Optional[str]:
+        """Draft a reply, from a stored mail or from text pasted right here.
+
+        Returning None hands the turn to the model with the mail attached; the
+        draft itself is the one job the local model is genuinely good at,
+        because it only has to transform text it was given.
+        """
+        pasted = intent.raw_text or ""
+        # A pasted mail wins over anything stored: it is what the user is
+        # looking at, and they may not have a watch rule for it at all.
+        if looks_pasted(pasted) and len(pasted) > 160:
+            source, label = pasted, "붙여넣은 메일"
+        else:
+            mail = self.db.find_recent_mail(intent.query)
+            if mail is None:
+                return ("답장할 메일을 찾지 못했습니다.\n"
+                        "‘최근 메일 보여줘’ 로 보관된 메일을 확인하시거나, "
+                        "메일 내용을 그대로 붙여넣고 ‘답장 써줘’ 라고 해주세요.")
+            when = mail["received_at"].strftime("%m/%d %H:%M") if mail["received_at"] else ""
+            source = (f"제목: {mail['subject']}\n"
+                      f"보낸사람: {mail['sender'] or '(미상)'}\n"
+                      f"받은시각: {when}\n\n{mail['body']}")
+            label = mail["subject"][:40]
+
+        wish = intent.action or "적절히 회신"
+        self.chat_view.add_message(
+            "ai", f"▤ ‘{label}’ 에 대한 답장을 작성합니다… ({wish})")
+        self._send_to_model(build_reply_prompt(source, wish))
+        return None                                   # the model answers
 
     def _tool_report(self, intent: ToolIntent) -> str:
         """"이번주 한 일" in the chat tab -- same text the dialog produces."""

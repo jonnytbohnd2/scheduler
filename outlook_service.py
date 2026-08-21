@@ -35,6 +35,7 @@ one-shot inbox scan only if Outlook happens to be running).
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -60,6 +61,74 @@ BODY_SCAN_CHARS = 4000
 # --------------------------------------------------------------------------- #
 # Pure matching logic (no COM, no Qt)
 # --------------------------------------------------------------------------- #
+
+#: The mail gateway prepends its own lines to anything from outside:
+#:
+#:     발신자 국가       네덜란드
+#:     발신서버 국가     네덜란드
+#:
+#:     Dear Jon,
+#:
+#: The greeting is therefore never the first line, and a naive check finds
+#: "발신자 국가" where it expected a name.
+_GATEWAY_LINE_RE = re.compile(
+    r"^\s*(발신자\s*국가|발신서버\s*국가|발신\s*국가|외부\s*메일|"
+    r"\[?외부\]?|caution|external|this email originated)\b.*$",
+    re.IGNORECASE)
+
+#: "Dear Jon," / "안녕하세요 성진님," / "허성진 님께" / "Hi Jon" / "To Jon"
+_SALUTATION_RES = (
+    re.compile(r"^\s*(?:dear|hi|hello|to)\s+([^,\n:]{1,40})", re.IGNORECASE),
+    re.compile(r"^\s*([^\s,]{1,20})\s*(?:님)\s*(?:께|에게|안녕|,|$)"),
+    re.compile(r"^\s*안녕하세요[,\s]*([^\s,]{1,20})\s*(?:님|씨|과장|대리|차장|부장|팀장)"),
+)
+
+#: How many lines past the gateway header to look in.
+SALUTATION_SCAN_LINES = 4
+
+
+def salutation_of(body: str) -> str:
+    """The name a mail opens by addressing, or '' when it opens generically.
+
+    Only the first few real lines are considered: a name appearing halfway
+    down is being talked about, not greeted.
+    """
+    if not body:
+        return ""
+    lines = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or _GATEWAY_LINE_RE.match(line):
+            continue
+        lines.append(line)
+        if len(lines) >= SALUTATION_SCAN_LINES:
+            break
+    for line in lines:
+        for pattern in _SALUTATION_RES:
+            found = pattern.match(line)
+            if found:
+                name = found.group(1).strip(" ,.-:님씨")
+                if name and not _GATEWAY_LINE_RE.match(name):
+                    return name
+    return ""
+
+
+def addressed_to_me(body: str, aliases: "list[str] | str") -> bool:
+    """True when the greeting names the user.
+
+    Cheaper and quieter than reading To/Cc: the body is exempt from Outlook's
+    object-model guard, while recipient fields are exactly what trips it.
+    """
+    if isinstance(aliases, str):
+        aliases = [a.strip() for a in re.split(r"[,;/]", aliases)]
+    names = [a.lower() for a in aliases if a and a.strip()]
+    if not names:
+        return False
+    greeted = salutation_of(body).lower()
+    if not greeted:
+        return False
+    return any(name in greeted or greeted in name for name in names)
+
 
 def match_keywords(rule: dict, subject: str, body: str = "") -> bool:
     """Keyword half of a rule -- checked against subject/body only.
@@ -136,10 +205,18 @@ class OutlookMonitorWorker(QObject):
     def __init__(self, db, interval_seconds: int = DEFAULT_INTERVAL_S,
                  scan_limit: int = DEFAULT_SCAN_LIMIT,
                  allow_launch: bool = False,
-                 calendar_enabled: bool = True) -> None:
+                 calendar_enabled: bool = True,
+                 keep_mails: bool = True, my_names: str = "",
+                 read_recipients: bool = False) -> None:
         super().__init__()
         self.db = db
         self.calendar_enabled = bool(calendar_enabled)
+        #: Store matched mails for "이거 답장 써줘".
+        self.keep_mails = bool(keep_mails)
+        #: Names/aliases that count as "addressed to me" in a greeting.
+        self.my_names = my_names or ""
+        #: Opt-in To/Cc read -- see :meth:`_is_direct_recipient`.
+        self.read_recipients = bool(read_recipients)
         self._meetings: list[dict] = []
         self._meetings_at: Optional[datetime] = None
         self.interval_seconds = max(3, int(interval_seconds))
@@ -369,6 +446,45 @@ class OutlookMonitorWorker(QObject):
         finally:
             self._busy.clear()
 
+    def _keep_mail(self, item: Any, subject: str, body: str,
+                   sender: str, rule_id: int) -> None:
+        """Store a matched mail so the chat tab can draft a reply to it."""
+        if not self.keep_mails:
+            return
+        try:
+            entry_id = self._safe(item, "EntryID", "") or f"{rule_id}:{subject[:40]}"
+            received = _as_datetime(getattr(item, "ReceivedTime", None))
+            addressed = addressed_to_me(body, self.my_names)
+            if not addressed and self.read_recipients:
+                # Opt-in: To/Cc are behind the same object-model guard that
+                # made sender lookups pop a dialog, so this stays off until
+                # the user has confirmed it is quiet on their machine.
+                addressed = self._is_direct_recipient(item)
+            self.db.save_recent_mail(
+                entry_id=entry_id, subject=subject, body=body, sender=sender,
+                received_at=received, addressed=addressed, rule_id=rule_id)
+        except Exception:                                        # noqa: BLE001
+            log.exception("Could not keep mail %r", subject[:40])
+
+    def _is_direct_recipient(self, item: Any) -> bool:
+        """Is the user on To (rather than only Cc)?
+
+        Reads ``Recipients``/``To``, which Outlook's guard may challenge --
+        hence :attr:`read_recipients`. Any failure is treated as "unknown"
+        and reported once, never raised.
+        """
+        names = [n.strip().lower() for n in
+                 re.split(r"[,;/]", self.my_names or "") if n.strip()]
+        if not names:
+            return False
+        try:
+            to_line = (self._safe(item, "To", "") or "").lower()
+            if to_line:
+                return any(n in to_line for n in names)
+        except Exception as exc:                                 # noqa: BLE001
+            log.info("Recipient read refused (%s); relying on the greeting", exc)
+        return False
+
     def _refresh_meetings(self) -> None:
         """Re-read today's calendar, but rarely.
 
@@ -439,6 +555,7 @@ class OutlookMonitorWorker(QObject):
                     self.db.mark_email_triggered(rule_id)
                 except Exception:                                # noqa: BLE001
                     log.exception("Could not mark rule #%d triggered", rule_id)
+                self._keep_mail(item, subject, body, sender_name, rule_id)
                 self.email_matched.emit(
                     rule_id, subject or "(제목 없음)", sender_name or "(발신자 미상)",
                     rule.get("reminder_action", ""))
@@ -560,7 +677,9 @@ class OutlookMonitorController(QObject):
     def __init__(self, db, interval_seconds: int = DEFAULT_INTERVAL_S,
                  scan_limit: int = DEFAULT_SCAN_LIMIT,
                  parent: Optional[QObject] = None,
-                 calendar_enabled: bool = True) -> None:
+                 calendar_enabled: bool = True,
+                 keep_mails: bool = True, my_names: str = "",
+                 read_recipients: bool = False) -> None:
         super().__init__(parent)
         self._available = False
         self._status_message = "확인 중"
@@ -568,8 +687,10 @@ class OutlookMonitorController(QObject):
 
         self.thread = QThread()
         self.thread.setObjectName("OutlookThread")
-        self.worker = OutlookMonitorWorker(db, interval_seconds, scan_limit,
-                                           calendar_enabled=calendar_enabled)
+        self.worker = OutlookMonitorWorker(
+            db, interval_seconds, scan_limit, calendar_enabled=calendar_enabled,
+            keep_mails=keep_mails, my_names=my_names,
+            read_recipients=read_recipients)
         self.worker.moveToThread(self.thread)
 
         self.worker.email_matched.connect(self.email_matched)
@@ -610,6 +731,12 @@ class OutlookMonitorController(QObject):
     def meetings(self) -> list[dict]:
         """Last known calendar entries for today (may be empty)."""
         return list(self._meetings)
+
+    def set_mail_options(self, keep: bool, my_names: str,
+                         read_recipients: bool) -> None:
+        self.worker.keep_mails = bool(keep)
+        self.worker.my_names = my_names or ""
+        self.worker.read_recipients = bool(read_recipients)
 
     def set_calendar_enabled(self, enabled: bool) -> None:
         self.worker.calendar_enabled = bool(enabled)

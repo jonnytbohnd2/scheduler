@@ -38,7 +38,8 @@ os.environ.setdefault("OFFLINESMARTHUD_DATA", tempfile.mkdtemp(prefix="hud_corpu
 
 from llm_engine import (TOOL_ADD, TOOL_ADD_EMAIL, TOOL_CLEAR, TOOL_DELETE,
                         TOOL_DELETE_EMAIL, TOOL_LIST, TOOL_LIST_EMAIL,
-                        TOOL_NONE, TOOL_REPORT, HeuristicParser,
+                        TOOL_LIST_MAIL, TOOL_NONE, TOOL_REPLY_MAIL,
+                        TOOL_REPORT, HeuristicParser,
                         detect_tool_intent)
 
 NOW = datetime(2026, 8, 21, 10, 0)          # Friday
@@ -307,8 +308,13 @@ def curated() -> list[Case]:
          "Sent: Monday, To: sjhuh@koreanre.co.kr Subject: RE: Korean Re / "
          "Marsh Leading Edge Presentation Hi All Thanks once again for your "
          "time today. Best regards, Tom", TOOL_NONE, None, None),
+        # ...and pasting one with "답장 써줘" is a reply request, using the
+        # text right there rather than anything stored.
         ("이 메일 답장 써줘\n보낸사람: 김영수 과장\n제목: 회의 일정 문의\n"
-         "다음 주 화요일 오후 2시에 진행하려 합니다.", TOOL_NONE, None, None),
+         "다음 주 화요일 오후 2시에 진행하려 합니다.", TOOL_REPLY_MAIL, None, None),
+        ("요율 검토 메일 답장 써줘", TOOL_REPLY_MAIL, None, None),
+        ("최근 메일 보여줘", TOOL_LIST_MAIL, None, None),
+        ("받은 메일 뭐 있지", TOOL_LIST_MAIL, None, None),
 
         # ---- multi-item ---------------------------------------------------- #
         ("8/24 엑셀 제출 / 8/31 ppt 제출", TOOL_ADD, "엑셀 제출",

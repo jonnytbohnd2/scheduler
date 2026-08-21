@@ -1106,6 +1106,8 @@ TOOL_ADD_EMAIL = "add_email_reminder"
 TOOL_LIST_EMAIL = "list_email_reminders"
 TOOL_DELETE_EMAIL = "delete_email_reminder"
 TOOL_REPORT = "work_report"
+TOOL_LIST_MAIL = "list_recent_mail"
+TOOL_REPLY_MAIL = "reply_to_mail"
 
 
 @dataclass(slots=True)
@@ -1132,6 +1134,23 @@ class ToolIntent:
         return {"tool": self.tool, "scope": self.scope, "query": self.query,
                 "keywords": self.keywords, "action": self.action}
 
+
+# "받은 메일 뭐 있지", "최근 메일 보여줘" -- what is available to reply to.
+_RECENT_MAIL_LIST_RE = re.compile(
+    r"(?:최근|받은|온|도착한)\s*(?:메일|이메일)\s*"
+    r"(?:목록|리스트|뭐|무엇|보여|알려|확인|있)"
+    r"|(?:메일|이메일)\s*(?:목록|리스트)\s*(?:보여|알려|확인)")
+
+# "요율 검토 메일 답장 써줘", "이거 답장 써줘 - 수락한다고",
+# "reply to the Marsh email saying well received"
+_REPLY_MAIL_RE = re.compile(
+    r"^\s*(?P<subject>.*?)\s*(?:메일|이메일|mail|email)?\s*"
+    r"(?:에\s*)?(?:답장|회신|답변|reply|respond)\s*"
+    r"(?:을|를|은|는)?\s*(?:써|작성|보내|draft|write)?\s*"
+    r"(?:줘|주세요|해줘|해\s*주세요|해라|it|to\s+it)?\s*"
+    r"(?:[-–—:,]\s*|하고\s*|라고\s*|으로\s*|saying\s*|해서\s*)?"
+    r"(?P<intent>.*)$",
+    re.IGNORECASE | re.DOTALL)
 
 # "이번주 한 일", "주간보고", "지난주 뭐 했지" -- the Friday report. Needs a
 # completed-work sense, so a bare "이번주 일정" stays a plain listing.
@@ -1346,6 +1365,20 @@ def detect_tool_intent(
             intent.keywords = keywords
             intent.action = action
             return intent
+
+    # 0.4) Mail. "요율 검토 메일 답장 써줘" must be caught before the compose
+    #      guard sends it to plain chat with no mail attached.
+    if _RECENT_MAIL_LIST_RE.search(low):
+        intent.tool = TOOL_LIST_MAIL
+        return intent
+    reply = _REPLY_MAIL_RE.search(raw)
+    if reply:
+        intent.tool = TOOL_REPLY_MAIL
+        # Whatever was said before the verb is the subject hint; empty means
+        # "the most recent one".
+        intent.query = _clean_fragment(reply.group("subject") or "")
+        intent.action = _clean_fragment(reply.group("intent") or "")
+        return intent
 
     # 0.5) Work report. "이번주 한 일" reads like a LIST query, so it has to be
     #      settled before the list matchers get hold of it.
@@ -1700,6 +1733,37 @@ def strip_think(text: str, mode: str = "hide") -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     cleaned = re.sub(r"^.*?</think>", "", cleaned, flags=re.DOTALL) if "</think>" in cleaned else cleaned
     return cleaned.strip()
+
+
+#: Drafting a reply is the one job a small local model is reliably good at:
+#: it only has to reshape text it was handed, never recall a fact. Measured on
+#: Qwen3.8-4B, the three cases that broke the 1.7B (accept / decline / no
+#: information) all came out sendable, and the "no information" one stopped
+#: inventing a status. The budget is generous because the model narrates its
+#: plan first when prompted in English -- the filter removes that, but it has
+#: to be allowed to finish.
+REPLY_MAX_TOKENS = 900
+
+REPLY_SYSTEM_PROMPT = (
+    "당신은 한국 재보험사 직원의 이메일 답장 작성 보조입니다.\n"
+    "받은 메일과 사용자의 답변 의도를 보고, 그대로 보낼 수 있는 답장 초안만 "
+    "출력하세요.\n"
+    "\n"
+    "규칙:\n"
+    "- 설명하지 말고 인사말부터 바로 시작하세요. 계획을 늘어놓지 마세요.\n"
+    "- 받은 메일이 영어면 영어로, 한국어면 한국어로 씁니다.\n"
+    "- 사용자가 알려준 사실만 씁니다. 날짜·금액·담당자·첨부파일을 지어내지 "
+    "마세요. 모르는 것은 [   ] 로 비워 둡니다.\n"
+    "- 3~6문장. 인사 - 본문 - 맺음말.\n"
+    "- 보낸 사람의 이름을 알면 호칭에 씁니다. 모르면 [이름] 으로 둡니다.\n"
+)
+
+
+def build_reply_prompt(mail_text: str, wish: str) -> str:
+    """The user turn for a reply draft."""
+    return (f"[받은 메일]\n{mail_text.strip()}\n\n"
+            f"[내 답변 의도]\n{wish.strip() or '적절히 회신'}\n\n"
+            f"위 메일에 대한 답장 초안을 작성해줘.")
 
 
 SYSTEM_PROMPT_FILENAME = "system_prompt.txt"
@@ -2145,9 +2209,15 @@ class LlmWorker(QObject):
                 return
 
             think_mode = str(self._opt("thinking", "hide"))
+            override_system, override_tokens = None, None
+            if isinstance(messages, dict):
+                override_system = messages.get("system")
+                override_tokens = messages.get("max_tokens")
+                messages = messages.get("messages") or []
             # Re-read each turn: editing system_prompt.txt takes effect
             # on the next message, with no restart.
-            payload = [{"role": "system", "content": load_system_prompt()}]
+            payload = [{"role": "system",
+                        "content": override_system or load_system_prompt()}]
             payload += [dict(m) for m in (messages or [])]
             if think_mode == "off" and payload:
                 # Qwen3 reads /no_think from the latest user turn.
@@ -2163,7 +2233,8 @@ class LlmWorker(QObject):
 
             stream = self._llm.create_chat_completion(
                 messages=payload,
-                max_tokens=int(self._opt("max_tokens", 512)),
+                max_tokens=int(override_tokens
+                               or self._opt("max_tokens", 512)),
                 temperature=float(self._opt("temperature", TEMP_CHAT)),
                 top_p=0.9,
                 repeat_penalty=1.1,
@@ -2392,11 +2463,19 @@ class LlmController(QObject):
         self._request_seq += 1
         return self._request_seq
 
-    def send_chat(self, messages: list[dict]) -> int:
+    def send_chat(self, messages: list[dict], system: Optional[str] = None,
+                  max_tokens: Optional[int] = None) -> int:
+        """`system` / `max_tokens` override the defaults for this call only.
+
+        A reply draft needs its own instructions and a bigger budget than a
+        chat turn, without disturbing either for the next message.
+        """
         request_id = self._next_id()
         if not self.thread.isRunning():
             self.start(preload=False)
-        self._do_chat.emit(request_id, messages)
+        payload = {"messages": messages, "system": system,
+                   "max_tokens": max_tokens}
+        self._do_chat.emit(request_id, payload)
         return request_id
 
     def cancel(self) -> None:
